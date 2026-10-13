@@ -1,0 +1,408 @@
+# Builds the iOS emulator core (libhyperhle_core.dylib) for Applesauce on a
+# GitHub-hosted macOS machine, so the core can be built without owning a Mac.
+#
+# How to use it: put this file in a repository as .github/workflows/build.yml,
+# then open the Actions tab, pick "Build iOS emulator core (dylib)" and press
+# "Run workflow". A run takes about 20-40 minutes; the finished dylib is in the
+# Artifacts section at the bottom of the run page.
+#
+# Nothing needs to be forked. The job checks out the upstream Applesauce
+# repository at a fixed commit on the runner itself, adds the one missing
+# CoreFoundation entry point (CFURLCreateDataAndPropertiesFromResource, the
+# reason games showed a black screen), builds the core, verifies the result and
+# uploads it. This file is the only file the account running it needs.
+
+name: Build iOS emulator core (dylib)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-core:
+    # Pinned rather than `macos-latest` on purpose: that label can move to a
+    # newer image at any time, and a surprise image change is exactly what
+    # turns a 30 minute run into a wasted one. macos-15 is current and is an
+    # Apple Silicon (arm64) runner. If this image is ever retired, change the
+    # line to macos-latest.
+    runs-on: macos-15
+    # Fails fast instead of hanging for GitHub's 6 hour default.
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out Applesauce at the pinned commit, with all submodules
+        uses: actions/checkout@v4
+        with:
+          repository: 0xjohnnydev/Applesauce
+          ref: e8e9d674a84903b14da0d9deb1dbe4f1dc735624
+          # Includes the nested SDL checkout inside vendor/rust-sdl2, which
+          # the shared SDL2 build compiles.
+          submodules: recursive
+          # Full history and tags: touchHLE_version asks `git describe`.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Show the checked-out revision and submodules
+        run: |
+          set -eu
+          git rev-parse HEAD
+          git submodule status --recursive | sed 's/^/  /'
+
+      - name: Choose the Xcode toolchain
+        run: |
+          set -eu
+          echo "Xcode installations on this machine:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          # The project documents Xcode 26 or newer, so prefer it when the
+          # image provides it; otherwise use whatever xcode-select already
+          # points at. Only DEVELOPER_DIR is exported, no global state changes.
+          dev_dir=
+          for candidate in /Applications/Xcode_26*.app; do
+            if [ -d "$candidate/Contents/Developer" ]; then
+              dev_dir="$candidate/Contents/Developer"
+              break
+            fi
+          done
+          if [ -z "$dev_dir" ]; then
+            dev_dir=$(xcode-select -p)
+          fi
+          echo "DEVELOPER_DIR=$dev_dir" >> "$GITHUB_ENV"
+          echo "Using DEVELOPER_DIR=$dev_dir"
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Install cmake, ninja and Boost headers
+        run: |
+          set -eu
+          brew install cmake ninja boost
+          boost_root="$(brew --prefix boost)/include"
+          if [ ! -d "$boost_root/boost" ]; then
+            echo "::error::Boost headers are not at $boost_root/boost"
+            exit 1
+          fi
+          echo "TOUCHHLE_BOOST_ROOT=$boost_root" >> "$GITHUB_ENV"
+          echo "Using TOUCHHLE_BOOST_ROOT=$boost_root"
+
+      - name: Add the Rust iOS target
+        run: |
+          set -eu
+          rustup target add aarch64-apple-ios
+          rustup target list --installed | grep -qx aarch64-apple-ios
+          echo "rustc:  $(rustc --version)"
+          echo "cargo:  $(cargo --version)"
+          echo "cmake:  $(cmake --version | head -1)"
+          echo "ninja:  $(ninja --version)"
+          echo "python: $(python3 --version)"
+
+      - name: Patch in the missing CoreFoundation API
+        run: |
+          set -eu
+          python3 - <<'PATCH_PY'
+          #!/usr/bin/env python3
+          """Add CFURLCreateDataAndPropertiesFromResource to the emulator core's CFURL.
+
+          Applesauce's bundled HyperHLE core does not implement the legacy CFURLAccess
+          entry point `CFURLCreateDataAndPropertiesFromResource`, so games that call it
+          die while starting up (the visible symptom is a black screen). This script
+          inserts the implementation, taken from KlugKlugTG/HyperHLE-Fork
+          (src/frameworks/core_foundation/cf_url.rs), into an Applesauce checkout and
+          registers it in the module's `FUNCTIONS` export table.
+
+          The inserted code is deliberately self-contained: every path it needs that the
+          target file does not already `use` is written out in full, so no import line has
+          to be edited. Only one API is added; nothing else is copied from the fork.
+
+          Usage: python3 patch_cf_url.py [repo-root]        (default: current directory)
+
+          The script refuses to run unless the patch applies cleanly, and re-checks both
+          the definition and the export afterwards, so a silent no-op is impossible.
+          """
+
+          import sys
+          from pathlib import Path
+
+          TARGET = "src/frameworks/core_foundation/cf_url.rs"
+
+          # The function to insert, verbatim apart from fully-qualified paths (see above).
+          FUNCTION_SRC = r'''
+          // MARK: - Resource access (CFURLAccess.h)
+
+          /// `Boolean CFURLCreateDataAndPropertiesFromResource(CFAllocatorRef alloc,
+          ///     CFURLRef url, CFDataRef *data, CFDictionaryRef *properties,
+          ///     CFTypeRef desiredProperties, SInt32 *errorCode)`
+          ///
+          /// Legacy CFURLAccess API: loads a resource's bytes and/or a dictionary of
+          /// its properties. Apps use it (via their plist/XML glue) to read local
+          /// files referenced by `file://` URLs.
+          ///
+          /// - `data` (optional) receives the resource contents as a CFData.
+          /// - `properties` (optional) receives a dictionary with the properties named
+          ///   in `desiredProperties` (or all known ones when it is NULL): we support
+          ///   the file length, the one property callers actually consult.
+          /// - `errorCode` (optional) receives `kCFURLSuccess` (0) or
+          ///   `kCFURLUnknownError` (-10).
+          #[allow(clippy::too_many_arguments)]
+          fn CFURLCreateDataAndPropertiesFromResource(
+              env: &mut Environment,
+              _allocator: crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef,
+              url: CFURLRef,
+              data: MutPtr<crate::frameworks::core_foundation::cf_data::CFDataRef>,
+              properties: MutPtr<id>,
+              _desired_properties: super::CFTypeRef,
+              error_code: MutPtr<i32>,
+          ) -> bool {
+              const K_CF_URL_SUCCESS: i32 = 0;
+              const K_CF_URL_UNKNOWN_ERROR: i32 = -10;
+
+              if url.is_null() {
+                  if !error_code.is_null() {
+                      env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+                  }
+                  return false;
+              }
+
+              // Get the file-system path for the URL.
+              const PATH_MAX: crate::mem::GuestUSize = 4096;
+              let path_buf: MutPtr<u8> = env.mem.alloc(PATH_MAX).cast();
+              let ok: bool = msg![env; url getFileSystemRepresentation:path_buf maxLength:PATH_MAX];
+              let path = if ok {
+                  let cstr = env.mem.cstr_at_utf8(path_buf);
+                  cstr.ok().map(|s| s.to_owned())
+              } else {
+                  None
+              };
+              env.mem.free(path_buf.cast());
+
+              let Some(path) = path else {
+                  if !error_code.is_null() {
+                      env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+                  }
+                  return false;
+              };
+
+              let file_len = std::fs::metadata(&path).map(|m| m.len()).ok();
+
+              if !data.is_null() {
+                  match std::fs::read(&path) {
+                      Ok(bytes) => {
+                          let length: CFIndex = bytes.len() as CFIndex;
+                          let bytes_ptr =
+                              env.mem.alloc(bytes.len().max(1) as crate::mem::GuestUSize);
+                          env.mem
+                              .bytes_at_mut(bytes_ptr.cast(), bytes.len() as crate::mem::GuestUSize)
+                              .copy_from_slice(&bytes);
+                          let cf_data = crate::frameworks::core_foundation::cf_data::CFDataCreate(
+                              env,
+                              super::cf_allocator::kCFAllocatorDefault,
+                              bytes_ptr.cast::<u8>().cast_const(),
+                              length,
+                          );
+                          env.mem.write(data, cf_data);
+                      }
+                      Err(err) => {
+                          log_dbg!(
+                              "CFURLCreateDataAndPropertiesFromResource: couldn't read {:?}: {}",
+                              path,
+                              err
+                          );
+                          if !error_code.is_null() {
+                              env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+                          }
+                          return false;
+                      }
+                  }
+              }
+
+              if !properties.is_null() {
+                  let mut dict: id = msg_class![env; NSMutableDictionary dictionary];
+                  if let Some(len) = file_len {
+                      let key = get_static_str(env, "NSURLFileSize");
+                      let len_i64 = len as i64;
+                      let number: id = msg_class![env; NSNumber alloc];
+                      let number: id = msg![env; number initWithLongLong:len_i64];
+                      let _prev: () = msg![env; dict setObject:number forKey:key];
+                      let _ = dict;
+                  }
+                  env.mem.write(properties, dict);
+              }
+
+              if !error_code.is_null() {
+                  env.mem.write(error_code, K_CF_URL_SUCCESS);
+              }
+              true
+          }
+          '''.lstrip("\n")
+
+          # The function goes just above the module's export table, and its entry goes
+          # into that table.
+          EXPORTS_ANCHOR = "// MARK: - Exports\n\npub const FUNCTIONS: FunctionExports = &[\n"
+          EXPORT_ANCHOR = "    export_c_func!(CFURLRelease(_)),\n"
+          EXPORT_ENTRY = (
+              "    // Resource access (CFURLAccess.h, deprecated by Apple but used by apps)\n"
+              "    export_c_func!(CFURLCreateDataAndPropertiesFromResource(_, _, _, _, _, _)),\n"
+          )
+
+          DEFINITION_MARKER = "fn CFURLCreateDataAndPropertiesFromResource("
+          EXPORT_MARKER = "export_c_func!(CFURLCreateDataAndPropertiesFromResource"
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+              path = repo / TARGET
+              if not path.is_file():
+                  fail("{} does not exist".format(path))
+
+              text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+              definitions = text.count(DEFINITION_MARKER)
+              if definitions > 1:
+                  fail("{} already contains {} definitions of the function".format(path, definitions))
+
+              if definitions == 0:
+                  if text.count(EXPORTS_ANCHOR) != 1:
+                      fail("cannot find the export table anchor ({} matches) in {}".format(
+                          text.count(EXPORTS_ANCHOR), path))
+                  if text.count(EXPORT_ANCHOR) != 1:
+                      fail("cannot find the export anchor ({} matches) in {}".format(
+                          text.count(EXPORT_ANCHOR), path))
+
+                  text = text.replace(EXPORTS_ANCHOR, FUNCTION_SRC + "\n" + EXPORTS_ANCHOR, 1)
+                  text = text.replace(EXPORT_ANCHOR, EXPORT_ANCHOR + EXPORT_ENTRY, 1)
+                  print("Inserted the function and its export entry into {}".format(TARGET))
+              elif text.count(EXPORT_MARKER) == 0:
+                  print("The function is already present; adding the missing export entry")
+                  if text.count(EXPORT_ANCHOR) != 1:
+                      fail("function present but the export anchor is missing")
+                  text = text.replace(EXPORT_ANCHOR, EXPORT_ANCHOR + EXPORT_ENTRY, 1)
+              else:
+                  print("The function and its export entry are already present; nothing to do")
+
+              # Post-conditions: exactly one definition, exactly one export, and the file
+              # is still brace-balanced (catches a truncated or duplicated insertion).
+              if text.count(DEFINITION_MARKER) != 1:
+                  fail("expected exactly 1 definition, found {}".format(text.count(DEFINITION_MARKER)))
+              if text.count(EXPORT_MARKER) != 1:
+                  fail("expected exactly 1 export entry, found {}".format(text.count(EXPORT_MARKER)))
+              if text.count("{") != text.count("}"):
+                  fail("unbalanced braces: {} '{{' vs {} '}}'".format(text.count("{"), text.count("}")))
+
+              with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                  output_file.write(text)
+              print("Wrote {}".format(path))
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_PY
+
+      - name: Check that the patch really landed
+        run: |
+          set -eu
+          file=src/frameworks/core_foundation/cf_url.rs
+          definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$file" || true)
+          exports=$(grep -c "export_c_func!(CFURLCreateDataAndPropertiesFromResource" "$file" || true)
+          echo "definitions=$definitions exports=$exports"
+          if [ "$definitions" != "1" ] || [ "$exports" != "1" ]; then
+            echo "::error::the patch did not apply cleanly (definitions=$definitions, exports=$exports)"
+            exit 1
+          fi
+
+      - name: Build the shared SDL2 the core links against
+        run: |
+          set -eu
+          echo "build-sdl-shared.sh started at $(date -u +%H:%M:%S) UTC"
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+          echo "build-sdl-shared.sh finished at $(date -u +%H:%M:%S) UTC"
+          # sdl2-sys asks the linker for `-lSDL2` while CMake installs the
+          # versioned name. CMake normally leaves the unversioned symlink in
+          # place; create it if it is missing rather than fail much later.
+          sdl_lib_dir="$PWD/build/sdl-shared-iphoneos/install/lib"
+          if [ ! -e "$sdl_lib_dir/libSDL2.dylib" ] && [ -f "$sdl_lib_dir/libSDL2-2.0.0.dylib" ]; then
+            ln -s libSDL2-2.0.0.dylib "$sdl_lib_dir/libSDL2.dylib"
+            echo "Created $sdl_lib_dir/libSDL2.dylib -> libSDL2-2.0.0.dylib"
+          fi
+          ls -l "$sdl_lib_dir"
+
+      - name: Build the core dylib (this is the long part)
+        run: |
+          set -eu
+          echo "Core build started at $(date -u +%H:%M:%S) UTC"
+          sh platform/ios/scripts/build-rust.sh aarch64-apple-ios Release
+          echo "Core build finished at $(date -u +%H:%M:%S) UTC"
+
+      - name: Verify the dylib
+        run: |
+          set -eu
+          dylib=build/rust-ios-native/aarch64-apple-ios/release/libhyperhle_core.dylib
+
+          echo "== the file exists and is not empty =="
+          if [ ! -s "$dylib" ]; then
+            echo "::error::$dylib is missing or empty"
+            exit 1
+          fi
+          ls -l "$dylib"
+
+          echo "== file(1): it is an arm64 Mach-O dylib =="
+          file "$dylib"
+          file "$dylib" | grep -q "Mach-O 64-bit" || { echo "::error::not a 64-bit Mach-O"; exit 1; }
+          file "$dylib" | grep -q "arm64" || { echo "::error::not arm64"; exit 1; }
+
+          echo "== vtool -show-build: platform IOS, minimum iOS 15.0 =="
+          xcrun vtool -show-build "$dylib"
+          platform=$(xcrun vtool -show-build "$dylib" | awk '/platform/ { print $2; exit }')
+          if [ "$platform" != "IOS" ]; then
+            echo "::error::built for platform $platform, not IOS"
+            exit 1
+          fi
+          minos=$(xcrun vtool -show-build "$dylib" | awk '/minos/ { print $2; exit }')
+          if [ "$minos" != "15.0" ]; then
+            echo "::error::built for iOS $minos, not 15.0"
+            exit 1
+          fi
+
+          echo "== LINKEDIT string pool is 8-byte aligned (dyld refuses otherwise) =="
+          stroff=$(otool -l "$dylib" | awk '/LC_SYMTAB/ { found = 1 } found && $1 == "stroff" { print $2; exit }')
+          if [ -z "$stroff" ]; then
+            echo "::error::could not read stroff from LC_SYMTAB"
+            exit 1
+          fi
+          echo "stroff=$stroff"
+          if [ $((stroff % 8)) -ne 0 ]; then
+            echo "::error::LINKEDIT string pool is mis-aligned (stroff=$stroff)"
+            exit 1
+          fi
+
+          echo "== the API this build exists for is compiled in =="
+          found=$(strings "$dylib" | grep -c "CFURLCreateDataAndPropertiesFromResource" || true)
+          echo "CFURLCreateDataAndPropertiesFromResource occurrences: $found"
+          if [ "$found" -lt 1 ]; then
+            echo "::error::CFURLCreateDataAndPropertiesFromResource is not in the dylib"
+            exit 1
+          fi
+
+          echo "== code signature check (informational) =="
+          codesign -dv "$dylib" 2>&1 | head -5 || true
+
+      - name: Collect the dylib and its sha256
+        run: |
+          set -eu
+          dylib=build/rust-ios-native/aarch64-apple-ios/release/libhyperhle_core.dylib
+          mkdir -p dist
+          cp "$dylib" dist/libhyperhle_core.dylib
+          shasum -a 256 dist/libhyperhle_core.dylib | tee dist/libhyperhle_core.dylib.sha256
+          ls -l dist
+
+      - name: Upload the dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperhle-core-ios-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
