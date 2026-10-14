@@ -33,11 +33,11 @@
 # Artifacts section at the bottom of the run page.
 #
 # Nothing needs to be forked. The job checks out the upstream Applesauce
-# repository at a fixed commit on the runner itself, applies nine patches,
+# repository at a fixed commit on the runner itself, applies ten patches,
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v10 variant of build-core.yml (v1). v2 added the logging; v3 added
+# This is the v12 variant of build-core.yml (v1). v2 added the logging; v3 added
 # the first patch that fixes a bug instead of instrumenting one; v4 corrected
 # that patch and added two fields to the log it was hidden behind; v5 makes the
 # emulator decode EUC-KR, the encoding the app asks for; v6 added the
@@ -50,7 +50,10 @@
 # not a caller but a state-machine instruction and two data-table addresses; v10
 # fixes the `__vsprintf_chk` argument order, because disassembling the caller that
 # produced the empty path component showed it fills that name with a
-# `_FORTIFY_SOURCE` call whose buffer the emulator was leaving all-zero:
+# `_FORTIFY_SOURCE` call whose buffer the emulator was leaving all-zero; v12
+# fixes that same resource path, because the v10 device log showed patch A's own
+# reader asking the host filesystem for a guest path and failing 39 times out of
+# 39:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -172,8 +175,36 @@
 #     placeholders, and logs the first 20 calls (`VSPRINTFCHK`). An audit of the
 #     other nine printf-family entries against Apple's libc found no other wrong
 #     signature; they are untouched.
-# The artifact is named hyperhle-core-ios-arm64-v10 so it cannot be mistaken for
-# the v1..v9 dylibs.
+#   patch K (new in v12) fixes a bug too, and it is the other half of patch A's
+#     story. Patch A added `CFURLCreateDataAndPropertiesFromResource`, but it
+#     read the resource with `std::fs`, and the "file-system representation" it
+#     is handed is a *guest* path - `/var/mobile/Applications/<fake-UUID>/<App>.app/
+#     42049.act` - which exists only in touchHLE's virtual filesystem (for an app
+#     bundle, as a member of the `.ipa` ZIP archive). The host has no such file,
+#     so the lookup returned `kCFURLUnknownError` (-10) for every resource the app
+#     loads this way, the game printed `Fail to Create data` and dropped it, and
+#     because the read bypassed `env.fs` none of patch E's FSOPEN/FSREAD, patch
+#     F's probes or patch G's FSBYTES lines could report it either: that is the
+#     v10 device log exactly - 39 resources named by patch H's PATHFOUND with no
+#     file operation after them, 39 errors, and every texture the 1x1 placeholder.
+#     Patch K moves the size and the bytes to `env.fs.size`/`env.fs.read`, the one
+#     guest entry point that resolves `.ipa` members and that patches E and G
+#     trace, and adds a rate-limited `CFURLDATA url=... path=... len=... ok=...`
+#     line for the first 40 calls. The signature, the `errorCode` values, the
+#     `data`/`properties` out parameters, the `NSURLFileSize` key and the export
+#     entry are patch A's, verbatim. The trace is a normal-level `log!`, not the
+#     `log_dbg!` patch A used: `log::ENABLED_MODULES` is deliberately empty, so
+#     debug-level logs never reach a device log, which is why the failure patch A
+#     reported was never seen there. This is the app's only reading channel - it
+#     imports no `open`/`fopen`/`read` at all, and its `Documents`/`English`/
+#     `Fail to Create data`/`Error` string table is this load path's fingerprint -
+#     so patch K has to be complete rather than partial: it depends on nothing but
+#     the guest path `getFileSystemRepresentation:` returns, and it changes no
+#     language or `NSBundle` logic (the app hard-codes the "English"
+#     localization, which is unrelated to this bug). v12 is based on v10 rather
+#     than v11 so that the device log stays as clean as the v10 one.
+# The artifact is named hyperhle-core-ios-arm64-v12 so it cannot be mistaken for
+# the v1..v11 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -261,7 +292,8 @@ jobs:
       - name: Patch in the missing CoreFoundation API, the logging instrumentation,
              the bundle-root fallback, the EUC-KR decoding, the file/texture tracing,
              the filesystem probe/write tracing, the path-origin tracing, the
-             nil-component stack trace and the __vsprintf_chk signature fix
+             nil-component stack trace, the __vsprintf_chk signature fix and the
+             guest-filesystem resource read
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -4704,6 +4736,268 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_I_PY
+          python3 - <<'PATCH_K_PY'
+          #!/usr/bin/env python3
+          """Make `CFURLCreateDataAndPropertiesFromResource` read through the guest filesystem.
+
+          Counterpart of patch_cf_url.py (patch A): that script adds the legacy CFURLAccess
+          entry point `CFURLCreateDataAndPropertiesFromResource` to the emulator core;
+          this one fixes the way it reads.
+
+          The problem
+          -----------
+          `-[NSURL getFileSystemRepresentation:maxLength:]` returns a *guest* path, e.g.
+
+              /var/mobile/Applications/00000000-0000-0000-0000-000000000000/DNF_swordman.app/42049.act
+
+          That path exists in touchHLE's virtual filesystem (`src/fs.rs`) and, for an app
+          bundle, is backed by a member of the `.ipa` (ZIP archive) - it does not exist on
+          the host. Patch A's implementation nevertheless handed it to `std::fs::metadata`
+          and `std::fs::read`, so the lookup always failed, `errorCode` came back as
+          `kCFURLUnknownError` (-10), and every resource the app loads through this call
+          was reported as missing: the game prints `Fail to Create data` and drops it.
+          Because the read bypassed `env.fs`, none of patch E's `FSOPEN`/`FSREAD`, patch
+          F's probes or patch G's `FSBYTES` lines could report it either, which is exactly
+          what the real-device log showed - a resource `PATHFOUND` followed by no file
+          operation at all. The v10 device log has 39 resources found this way and 39
+          immediate errors, and every texture was the 1x1 placeholder.
+
+          What this script changes
+          ------------------------
+          Only the body of `CFURLCreateDataAndPropertiesFromResource`, and only the two
+          places that went to the host filesystem:
+
+            * the size for the `properties` dictionary now comes from `env.fs.size()`;
+            * the bytes now come from `env.fs.read()` (the same guest entry point
+              `-[NSData initWithContentsOfFile:]` and `NSBundle` use, and the one patch E
+              and patch G trace). `env.fs.read()` resolves IPA members correctly, which
+              `std::fs::read()` could never do.
+
+          Everything else - the signature, the `errorCode` values, the `data`/`properties`
+          out-parameter handling, the `NSURLFileSize` key, the export entry, the order in
+          which the out parameters are written - is unchanged. A rate-limited diagnostic
+          line (`CFURLDATA`, first 40 calls) is added so a device run can confirm the fix
+          is reached; neither the bytes nor the return value depend on it.
+
+          Two details matter for a device run:
+
+            * The trace uses `log!`, not `log_dbg!`. `log::ENABLED_MODULES` is deliberately
+              empty (`src/log.rs`), so every `log_dbg!` in this crate is suppressed on
+              device. Patch A logged the failure it hit that way, which is why no device
+              log ever showed it. The failure text moves into the rate-limited `log!`
+              helper for the same reason.
+            * This is not one of several read paths that could be checked against each
+              other: the app under test imports no `open`/`fopen`/`read` at all and reads
+              its resources only through CoreFoundation/CFURL. This function has to work
+              for every `file://` URL the app builds, or the app reads no resource at all.
+              Nothing here is conditional on a URL shape beyond the guest path that
+              `getFileSystemRepresentation:` returns, and no language / `NSBundle` logic is
+              touched.
+
+          Usage: python3 patch_cfurl_fs_v12.py [repo-root]     (default: current directory)
+
+          The script refuses to run unless the patch applies cleanly, and re-checks the
+          result afterwards, so a silent no-op is impossible. Running it twice is a no-op.
+          """
+
+          import sys
+          from pathlib import Path
+
+          TARGET = "src/frameworks/core_foundation/cf_url.rs"
+
+          # The exact text patch A left behind: the host-filesystem read this patch
+          # replaces. It must appear exactly once.
+          OLD_CHUNK = r'''
+              let file_len = std::fs::metadata(&path).map(|m| m.len()).ok();
+
+              if !data.is_null() {
+                  match std::fs::read(&path) {
+                      Ok(bytes) => {
+                          let length: CFIndex = bytes.len() as CFIndex;
+                          let bytes_ptr =
+                              env.mem.alloc(bytes.len().max(1) as crate::mem::GuestUSize);
+                          env.mem
+                              .bytes_at_mut(bytes_ptr.cast(), bytes.len() as crate::mem::GuestUSize)
+                              .copy_from_slice(&bytes);
+                          let cf_data = crate::frameworks::core_foundation::cf_data::CFDataCreate(
+                              env,
+                              super::cf_allocator::kCFAllocatorDefault,
+                              bytes_ptr.cast::<u8>().cast_const(),
+                              length,
+                          );
+                          env.mem.write(data, cf_data);
+                      }
+                      Err(err) => {
+                          log_dbg!(
+                              "CFURLCreateDataAndPropertiesFromResource: couldn't read {:?}: {}",
+                              path,
+                              err
+                          );
+                          if !error_code.is_null() {
+                              env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+                          }
+                          return false;
+                      }
+                  }
+              }
+          '''.lstrip("\n")
+
+          # What replaces it. The guest path is resolved by `env.fs`, which is the only
+          # layer that knows about the app bundle's `.ipa` members; the host-filesystem
+          # calls are gone. `file_len` keeps its name and its meaning (the size of the
+          # resource, or None if the guest filesystem has nothing at that path), so the
+          # `properties` block below is untouched.
+          NEW_CHUNK = r'''
+              // Patch K (v12): `getFileSystemRepresentation:` hands back a *guest* path
+              // (`/var/mobile/Applications/<fake-UUID>/<App>.app/...`), which exists only
+              // in the emulator's virtual filesystem - for an app-bundle file it is a
+              // member of the `.ipa` archive, not a host file. The previous code passed
+              // that path straight to `std::fs`, so the lookup failed for every resource
+              // the app loads this way, `errorCode` came back as kCFURLUnknownError and
+              // the caller dropped the resource. The bytes and the size now come from
+              // `env.fs`, the guest filesystem `NSData`, `NSBundle`, patch E's FSREAD and
+              // patch G's FSBYTES tracing all use.
+              let guest_path = crate::fs::GuestPath::new(&path);
+              let file_len = env.fs.size(guest_path).ok();
+
+              // The first 40 calls are named, so a device log shows that this call is
+              // reached and whether the guest read succeeded. `len` is the number of bytes
+              // delivered, or the guest size when the read itself failed, and `ok` mirrors
+              // this function's own result. Diagnostic only: neither the bytes nor the
+              // return value below depend on the log.
+              //
+              // `log!` and not the debug-level macro: `log::ENABLED_MODULES` is empty on
+              // purpose (`src/log.rs`), so every debug-level log in this crate is
+              // suppressed on device. That is why the failure line patch A wrote here was
+              // never visible in a device log, and why both lines below are normal-level
+              // logs.
+              fn note_cfurldata(url: id, path: &str, len: usize, ok: bool) {
+                  static CFURLDATA_LOGGED: std::sync::atomic::AtomicUsize =
+                      std::sync::atomic::AtomicUsize::new(0);
+                  if CFURLDATA_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                      return;
+                  }
+                  log!(
+                      "CFURLDATA url=0x{:08x} path={} len={} ok={}",
+                      url.to_bits(),
+                      path,
+                      len,
+                      ok
+                  );
+                  if !ok {
+                      log!("CFURLDATA no readable guest file at {:?}", path);
+                  }
+              }
+
+              if !data.is_null() {
+                  match env.fs.read(guest_path) {
+                      Ok(bytes) => {
+                          note_cfurldata(url, &path, bytes.len(), true);
+                          let length: CFIndex = bytes.len() as CFIndex;
+                          let bytes_ptr =
+                              env.mem.alloc(bytes.len().max(1) as crate::mem::GuestUSize);
+                          env.mem
+                              .bytes_at_mut(bytes_ptr.cast(), bytes.len() as crate::mem::GuestUSize)
+                              .copy_from_slice(&bytes);
+                          let cf_data = crate::frameworks::core_foundation::cf_data::CFDataCreate(
+                              env,
+                              super::cf_allocator::kCFAllocatorDefault,
+                              bytes_ptr.cast::<u8>().cast_const(),
+                              length,
+                          );
+                          env.mem.write(data, cf_data);
+                      }
+                      Err(_) => {
+                          note_cfurldata(url, &path, file_len.unwrap_or(0) as usize, false);
+                          if !error_code.is_null() {
+                              env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
+                          }
+                          return false;
+                      }
+                  }
+              }
+          '''.lstrip("\n")
+
+          DEFINITION_MARKER = "fn CFURLCreateDataAndPropertiesFromResource("
+          EXPORT_MARKER = "export_c_func!(CFURLCreateDataAndPropertiesFromResource"
+          # Marks the patch: present exactly once in a patched file, absent before.
+          PATCH_MARKER = "// Patch K (v12):"
+
+          # Post-conditions: (marker, expected count). The first two insist that the two
+          # host-filesystem calls patch A inserted are really gone; the rest pin the guest
+          # read, the size lookup and the trace to what this script claims it wrote.
+          POSTCONDITIONS = (
+              ("std::fs::", 0),
+              ("std::fs::read(&path)", 0),
+              ("std::fs::metadata(&path)", 0),
+              # `log_dbg!` is suppressed on device (`log::ENABLED_MODULES` is empty), so
+              # the failure patch A wrote that way was invisible; nothing in this function
+              # may use it any more.
+              ("log_dbg!", 0),
+              ("let guest_path = crate::fs::GuestPath::new(&path);", 1),
+              ("env.fs.size(guest_path)", 1),
+              ("match env.fs.read(guest_path) {", 1),
+              ("note_cfurldata(url, &path, bytes.len(), true);", 1),
+              ("note_cfurldata(url, &path, file_len.unwrap_or(0) as usize, false);", 1),
+              ('"CFURLDATA url=0x{:08x} path={} len={} ok={}",', 1),
+              ('"CFURLDATA no readable guest file at {:?}",', 1),
+              ("std::sync::atomic::AtomicUsize::new(0)", 1),
+          )
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def check(text, path):
+              """Everything that must hold of the file once this patch has been applied."""
+              if text.count(DEFINITION_MARKER) != 1:
+                  fail("expected exactly 1 definition of the function, found {}".format(
+                      text.count(DEFINITION_MARKER)))
+              if text.count(EXPORT_MARKER) != 1:
+                  fail("expected exactly 1 export entry, found {}".format(text.count(EXPORT_MARKER)))
+              if text.count(PATCH_MARKER) != 1:
+                  fail("expected exactly 1 patch marker, found {}".format(text.count(PATCH_MARKER)))
+              if text.count("{") != text.count("}"):
+                  fail("unbalanced braces: {} '{{' vs {} '}}'".format(text.count("{"), text.count("}")))
+              for marker, expected in POSTCONDITIONS:
+                  count = text.count(marker)
+                  if count != expected:
+                      fail("{}: {!r} appears {} time(s), expected {}".format(path, marker, count, expected))
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+              path = repo / TARGET
+              if not path.is_file():
+                  fail("{} does not exist".format(path))
+
+              original = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+              text = original
+
+              if PATCH_MARKER in text:
+                  print("The guest-filesystem read is already in place; nothing to do")
+              else:
+                  if text.count(OLD_CHUNK) != 1:
+                      fail("cannot find the host-filesystem read patch A inserted ({} matches); "
+                           "is patch A applied?".format(text.count(OLD_CHUNK)))
+                  text = text.replace(OLD_CHUNK, NEW_CHUNK, 1)
+                  print("Replaced the host-filesystem read with env.fs in {}".format(TARGET))
+
+              check(text, TARGET)
+
+              if text != original:
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("Wrote {}".format(path))
+              else:
+                  print("{} is unchanged".format(path))
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_K_PY
 
       - name: Check that the patches really landed
         run: |
@@ -4712,7 +5006,8 @@ jobs:
           # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5), the
           # file-access / texture-upload tracing (E, v6), the filesystem probe / write
           # tracing (F, v7), the path-origin tracing (G, v8), the nil-component stack
-          # trace (H, v9) and the `__vsprintf_chk` signature fix (I, v10).
+          # trace (H, v9), the `__vsprintf_chk` signature fix (I, v10) and the guest-
+          # filesystem resource read (K, v12).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
@@ -4723,7 +5018,9 @@ jobs:
           # path into a directory, or still reports only the single PC/return-address pair
           # that the v8 device log proved is not a caller, or still left the buffer of a
           # `_FORTIFY_SOURCE` printf all-zero because `__vsprintf_chk` read the wrong
-          # argument.
+          # argument, or still read the bytes that
+          # CFURLCreateDataAndPropertiesFromResource returns through the host filesystem
+          # instead of the emulated one.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -5774,6 +6071,159 @@ jobs:
                 "printf-family signatures the audit checked are unchanged")
           CHECK_VSPRINTFCHK
 
+          echo "== patch K (v12): the resource read goes through the guest filesystem =="
+          # Patch K fixes a bug, like patches A, C, D and I. It changes one function and
+          # only the way it reads: the bytes and the size that
+          # CFURLCreateDataAndPropertiesFromResource returns now come from `env.fs`, the
+          # guest filesystem, instead of `std::fs`, the host filesystem that never had the
+          # guest path in the first place. The counts are exact, and `src/frameworks/
+          # core_foundation/cf_url.rs` must not mention `std::fs::` at all: patch A's two
+          # host calls are what the v10 device log proved were failing 39 times out of 39
+          # (a resource `PATHFOUND`, then `Fail to Create data` and a 1x1 texture). The A-I
+          # assertions above are unchanged: the v12 script is the v10 script with this
+          # section appended.
+          core=src/frameworks/core_foundation/cf_url.rs
+          check_marker "$core" "std::fs::" 0
+          check_marker "$core" "std::fs::metadata(&path)" 0
+          check_marker "$core" "std::fs::read(&path)" 0
+          # Patch A logged the failure with `log_dbg!`, which `log::ENABLED_MODULES` turns
+          # off on device; the trace must be a normal-level log or the device log will not
+          # show it.
+          check_marker "$core" "log_dbg!" 0
+          check_marker "$core" "let guest_path = crate::fs::GuestPath::new(&path);" 1
+          check_marker "$core" "let file_len = env.fs.size(guest_path).ok();" 1
+          check_marker "$core" "match env.fs.read(guest_path) {" 1
+          check_marker "$core" "note_cfurldata(url, &path, bytes.len(), true);" 1
+          check_marker "$core" "note_cfurldata(url, &path, file_len.unwrap_or(0) as usize, false);" 1
+          check_marker "$core" "if CFURLDATA_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {" 1
+          check_marker "$core" '"CFURLDATA url=0x{:08x} path={} len={} ok={}",' 1
+          check_marker "$core" '"CFURLDATA no readable guest file at {:?}",' 1
+          # The export entry and the API itself are patch A's and must survive verbatim.
+          check_marker "$core" "export_c_func!(CFURLCreateDataAndPropertiesFromResource(_, _, _, _, _, _))," 1
+          check_marker "$core" "fn CFURLCreateDataAndPropertiesFromResource(" 1
+
+          python3 - <<'CHECK_CFURL_FS'
+          import pathlib
+          import sys
+
+          # The checks a substring count cannot make: the signature and the out-parameter
+          # semantics have to be exactly patch A's, the body must not reach the host
+          # filesystem at all, the read has to be what decides the error code in both
+          # directions, and the trace has to sit in both arms of the read.
+          problems = []
+
+          core = pathlib.Path("src/frameworks/core_foundation/cf_url.rs").read_text(encoding="utf-8")
+
+          if "std::fs::" in core:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the file still refers to std::fs::")
+          if core.count("{") != core.count("}"):
+              problems.append("src/frameworks/core_foundation/cf_url.rs: braces are unbalanced")
+
+          head = "fn CFURLCreateDataAndPropertiesFromResource(\n"
+          body = core[core.index(head) + len(head):]
+          body = body[:body.index("\n}\n")]
+
+          # 1. The signature is unchanged (patch A's seven parameters, in order), so the
+          #    export entry and every caller keep working.
+          params = [line.strip().rstrip(",") for line in body.split(") -> bool {")[0].splitlines()]
+          wanted = [
+              "env: &mut Environment",
+              "_allocator: crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef",
+              "url: CFURLRef",
+              "data: MutPtr<crate::frameworks::core_foundation::cf_data::CFDataRef>",
+              "properties: MutPtr<id>",
+              "_desired_properties: super::CFTypeRef",
+              "error_code: MutPtr<i32>",
+          ]
+          if params != wanted:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the parameters are {!r}, expected {!r}".format(
+                  params, wanted))
+
+          # 2. Nothing inside the function reaches the host filesystem, and the guest path,
+          #    the size and the bytes all come from env.fs. `std::fs::` (not the bare
+          #    `std::fs` the comment mentions) is what a host-filesystem call looks like.
+          if "std::fs::" in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the function still reaches the host"
+                              " filesystem (std::fs::)")
+          for needed in ("let guest_path = crate::fs::GuestPath::new(&path);",
+                         "let file_len = env.fs.size(guest_path).ok();",
+                         "match env.fs.read(guest_path) {"):
+              if needed not in body:
+                  problems.append("src/frameworks/core_foundation/cf_url.rs: the function is missing {!r}".format(needed))
+          if "metadata(" in body or "::read(&path)" in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: a host-filesystem read survives in the function")
+
+          # 3. The read decides the error code in both directions, exactly like patch A.
+          ok_arm = body[body.index("Ok(bytes) => {"):]
+          ok_arm = ok_arm[:ok_arm.index("Err(_) => {")]
+          err_arm = body[body.index("Err(_) => {"):]
+          if "env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);" not in err_arm:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: a failed guest read no longer"
+                              " reports kCFURLUnknownError")
+          if "return false;" not in err_arm:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: a failed guest read no longer returns false")
+          if "env.mem.write(error_code, K_CF_URL_SUCCESS);" not in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the success error code is gone")
+
+          # 4. The bytes still become a CFData through the same constructor and the same
+          #    out parameter; the size still reaches the properties dictionary under the
+          #    same key.
+          for needed in ("let cf_data = crate::frameworks::core_foundation::cf_data::CFDataCreate(",
+                         "env.mem.write(data, cf_data);",
+                         'get_static_str(env, "NSURLFileSize")',
+                         "msg![env; dict setObject:number forKey:key];",
+                         "env.mem.write(properties, dict);"):
+              if needed not in body:
+                  problems.append("src/frameworks/core_foundation/cf_url.rs: {!r} is gone".format(needed))
+
+          # 5. The trace: one nested rate-limited helper, the required format string, both
+          #    arms calling it with the length they know, and the ok arm logging before it
+          #    builds the CFData. Both lines are normal-level `log!` calls, because
+          #    `log_dbg!` is suppressed on device (`log::ENABLED_MODULES` is empty).
+          if body.count("note_cfurldata(url, &path, ") != 2:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the trace is called {} time(s), expected 2".format(
+                  body.count("note_cfurldata(url, &path, ")))
+          if "if CFURLDATA_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {" not in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the trace is not rate limited to 40 calls")
+          if "static CFURLDATA_LOGGED: std::sync::atomic::AtomicUsize =" not in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the trace counter is gone")
+          if "log_dbg" in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the function still logs at debug level"
+                              " (log_dbg!), which log::ENABLED_MODULES suppresses on device")
+          if "log!(" not in body:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the trace does not use log!")
+          for needed in ('"CFURLDATA url=0x{:08x} path={} len={} ok={}",',
+                         '"CFURLDATA no readable guest file at {:?}",'):
+              if needed not in body:
+                  problems.append("src/frameworks/core_foundation/cf_url.rs: the trace is missing {!r}".format(needed))
+          helper = body[body.index("fn note_cfurldata("):]
+          helper = helper[:helper.index("\n    }")]
+          for needed in ('"CFURLDATA url=0x{:08x} path={} len={} ok={}",',
+                         '"CFURLDATA no readable guest file at {:?}",'):
+              if needed not in helper:
+                  problems.append("src/frameworks/core_foundation/cf_url.rs: {!r} is not inside the rate-limited"
+                                  " helper".format(needed))
+          if "note_cfurldata(url, &path, bytes.len(), true);" not in ok_arm:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the successful arm does not log")
+          if ok_arm.index("note_cfurldata(url, &path, bytes.len(), true);") > ok_arm.index("CFDataCreate("):
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the successful arm logs after building the CFData")
+          if "note_cfurldata(url, &path, file_len.unwrap_or(0) as usize, false);" not in err_arm:
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the failed arm does not log")
+          if err_arm.index("note_cfurldata(url, &path, file_len.unwrap_or(0) as usize, false);") \
+                  > err_arm.index("return false;"):
+              problems.append("src/frameworks/core_foundation/cf_url.rs: the failed arm logs after returning")
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch K: CFURLCreateDataAndPropertiesFromResource keeps patch A's signature and its"
+                " data/properties/errorCode semantics, but the size comes from env.fs.size and the bytes"
+                " from env.fs.read - no std::fs call survives in the file - and the first 40 calls log a"
+                " normal-level 'CFURLDATA url=... path=... len=... ok=...' line in both arms of the read"
+                " (log!, not the log_dbg! that log::ENABLED_MODULES suppresses on device)")
+          CHECK_CFURL_FS
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -5862,7 +6312,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v10
+          name: hyperhle-core-ios-arm64-v12
           path: dist/*
           if-no-files-found: error
           retention-days: 30
