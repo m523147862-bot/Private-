@@ -33,17 +33,19 @@
 # Artifacts section at the bottom of the run page.
 #
 # Nothing needs to be forked. The job checks out the upstream Applesauce
-# repository at a fixed commit on the runner itself, applies six patches,
+# repository at a fixed commit on the runner itself, applies seven patches,
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v7 variant of build-core.yml (v1). v2 added the logging; v3 added
+# This is the v8 variant of build-core.yml (v1). v2 added the logging; v3 added
 # the first patch that fixes a bug instead of instrumenting one; v4 corrected
 # that patch and added two fields to the log it was hidden behind; v5 makes the
 # emulator decode EUC-KR, the encoding the app asks for; v6 added the
-# file-access and texture-upload tracing; v7 adds the tracing of the
-# filesystem calls that never open a file, because the v6 device log showed a
-# path that is opened 30 times and is never a file:
+# file-access and texture-upload tracing; v7 added the tracing of the filesystem
+# calls that never open a file, because the v6 device log showed a path that is
+# opened 30 times and is never a file; v8 adds the tracing of where that nil
+# path component comes from, because the v7 device log showed the mechanism but
+# not the culprit:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -81,26 +83,50 @@
 #     Fs::read), every glTexImage2D and glCompressedTexImage2D upload with its
 #     size, a count of glDrawArrays/glDrawElements, and one cumulative
 #     "FS SUMMARY" line every 600 guest frames.
-#   patch F (new in v7) is instrumentation too, and it follows up what the v6
-#     log found: only nine files were read at all (none of them a game
-#     resource), and all 30 "FSOPEN ok" lines point at the same *directory*,
-#     <App>/Documents, retried about once every ten frames. Patch E could not
-#     see why, because the path is built and probed in calls that never open
-#     anything. Patch F adds: a "PATHJOIN WARNING" line whenever
-#     -[NSString stringByAppendingPathComponent:] gets a nil or empty component
-#     (that is exactly how ".../Documents" + "" stays ".../Documents", i.e. how
-#     a file name is lost), "FSEXIST"/"FSLIST"/"FSATTR"/"FSREADABLE"/
-#     "FSWRITABLE" lines for the NSFileManager probe calls, "FSWRITE" for every
-#     open() that asks to write or create and "FSCREATE" for every "write this
-#     whole file" call (NSData writeToFile:, NSFileManager createFileAtPath:,
-#     NSString writeToFile:, ...), the guest PC of a failed open, and a summary
-#     at frame 60 and every 300 frames plus a final one on exit (a device run is
-#     only a few hundred frames long, so patch E's 600-frame line never fired
-#     there). No return value and no branch of the emulated call is touched; the
-#     rate limit, the counters and the summary cadence live in the new
+#   patch F (v7) is instrumentation too, and it follows up what the v6 log
+#     found: only nine files were read at all (none of them a game resource),
+#     and all 30 "FSOPEN ok" lines point at the same *directory*, <App>/Documents,
+#     retried about once every ten frames. Patch E could not see why, because the
+#     path is built and probed in calls that never open anything. Patch F adds: a
+#     "PATHJOIN WARNING" line whenever -[NSString
+#     stringByAppendingPathComponent:] gets a nil or empty component (that is
+#     exactly how ".../Documents" + "" stays ".../Documents", i.e. how a file
+#     name is lost), "FSEXIST"/"FSLIST"/"FSATTR"/"FSREADABLE"/"FSWRITABLE" lines
+#     for the NSFileManager probe calls, "FSWRITE" for every open() that asks to
+#     write or create and "FSCREATE" for every "write this whole file" call
+#     (NSData writeToFile:, NSFileManager createFileAtPath:, NSString
+#     writeToFile:, ...), the guest PC of a failed open, and a summary at frame
+#     60 and every 300 frames plus a final one on exit (a device run is only a
+#     few hundred frames long, so patch E's 600-frame line never fired there).
+#     No return value and no branch of the emulated call is touched; the rate
+#     limit, the counters and the summary cadence live in the new
 #     src/fs_probe.rs.
-# The artifact is named hyperhle-core-ios-arm64-v7 so it cannot be mistaken for
-# the v1..v6 dylibs.
+#   patch G (new in v8) is instrumentation too, and it answers the one question
+#     patch F left open. The v7 device log is unambiguous about the mechanism:
+#     27 of the 28 uploaded textures are 1x1 placeholders (only the 512x32 font
+#     atlas is real), and the same path, <App>/Documents, is opened about once
+#     every 13 frames forever, because the app calls -[NSString
+#     stringByAppendingPathComponent:] with a nil or empty component and
+#     ".../Documents" + "" stays ".../Documents". What the log cannot say is
+#     *which* guest code produced the nil. Patch G adds: a "PATHJOIN ORIGIN" line
+#     beside patch F's warning, carrying the guest program counter and the guest
+#     return address of the very call that dropped the component (the two
+#     addresses locate the caller in a disassembly of the app); an "NSDEFAULTS"
+#     line for every NSUserDefaults key lookup (objectForKey:, stringForKey:,
+#     arrayForKey:, dictionaryForKey:, boolForKey:, integerForKey:) with the key
+#     and a one-token summary of the result, because a stringForKey: that answers
+#     nil is passed straight into stringByAppendingPathComponent: and is the
+#     most likely source of the nil; an "NSREAD" line for the whole-file
+#     NSString/NSData readers, which patch E could only count and never name; and
+#     "FSBYTES", the length and the first 32 bytes of the three files the app
+#     creates in its own container (Documents/DnfSlot, Documents/DnfOpt and
+#     Library/Preferences/com.nexonmobile.dnfswordman.plist), so an empty or
+#     all-zero file can be recognised at a glance. Like B, E and F it changes no
+#     return value and no branch, the rate limit lives in the new
+#     src/fs_origin.rs, and patch G does not edit a single line patches A-F
+#     inserted.
+# The artifact is named hyperhle-core-ios-arm64-v8 so it cannot be mistaken for
+# the v1..v7 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -186,8 +212,8 @@ jobs:
           echo "python: $(python3 --version)"
 
       - name: Patch in the missing CoreFoundation API, the logging instrumentation,
-             the bundle-root fallback, the EUC-KR decoding, the file/texture tracing
-             and the filesystem probe/write tracing
+             the bundle-root fallback, the EUC-KR decoding, the file/texture tracing,
+             the filesystem probe/write tracing and the path-origin tracing
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -2802,20 +2828,953 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_F_PY
+          python3 - <<'PATCH_G_PY'
+          #!/usr/bin/env python3
+          """Where the nil path component comes from (patch G, v8) for the Applesauce iOS core.
+
+          Counterpart of patch_cf_url.py (patch A), patch_logging_v2.py (patch B),
+          patch_ns_bundle_root_fallback_v4.py (patch C), patch_euckr_v5.py (patch D),
+          patch_fsinstrument_v6.py (patch E) and patch_fsprobe_v7.py (patch F). Like
+          patch B, patch E and patch F this one is instrumentation only: it adds no API,
+          no fallback and no behaviour change. Patch G does not edit one single line that
+          patches A-F inserted - every insertion goes *beside* the existing statement,
+          which is the property the v8 self-check re-asserts for each of the A-F markers.
+
+          What it is for
+          --------------
+          The v7 device log settled the mechanism: 27 of the 28 uploaded textures are 1x1
+          placeholders (only the 512x32 font atlas is real), and the app opens the same
+          *path*, `<App>/Documents`, about once every 13 frames, forever. Patch F's
+          `PATHJOIN WARNING` line shows that `-[NSString
+          stringByAppendingPathComponent:]` is called with a nil or empty component 36
+          times, and that is exactly how a file name becomes `<App>/Documents` + `""` =
+          `<App>/Documents`: the path that is opened as a file, where lseek/read then
+          fail. What the log still cannot answer is *which* guest step produced the nil.
+          Patch G answers that, with four kinds of line and no behaviour change:
+
+            G1  `src/fs_origin.rs` (new file): the line formats and the rate limit, so
+                every call site below is a single added statement.
+            G2  `src/frameworks/foundation/ns_string.rs`,
+                `-[NSString stringByAppendingPathComponent:]`: beside patch F's
+                `PATHJOIN WARNING`, a `PATHJOIN ORIGIN` line with the guest program
+                counter and the guest return address of the very call that dropped the
+                component (`pc=` is the instruction after the `svc` that entered the host,
+                the same value patch F logs for a failed open; `ret=` is the guest link
+                register, i.e. the address the guest returns to). Disassembling around
+                those two addresses shows where the string that should have been the file
+                name came from.
+            G3  `src/frameworks/foundation/ns_user_defaults.rs`, the six key lookups
+                `objectForKey:`, `stringForKey:`, `arrayForKey:`, `dictionaryForKey:`,
+                `boolForKey:` and `integerForKey:`: `NSDEFAULTS <selector> key="..." ->`
+                `nil` / `str(len=N)` / `<class name>`. This is the number one suspect for
+                "the file name is empty": a `stringForKey:` that answers nil is passed
+                straight into `stringByAppendingPathComponent:`. Every typed getter
+                forwards to `objectForKey:`, so a `stringForKey:` query prints two lines
+                (its own and the inner lookup) - by design, so the shared lookup path and
+                the typed wrapper can be told apart.
+            G4  `src/frameworks/foundation/ns_string.rs` and
+                `src/frameworks/foundation/ns_data.rs`, the whole-file readers
+                `-[NSString initWithContentsOfFile:]`, `-...encoding:error:`,
+                `-...usedEncoding:error:` and `-[NSData initWithContentsOfFile:]` (which
+                `+stringWithContentsOfFile:...` and `+dataWithContentsOfFile:` forward to):
+                `NSREAD <kind> <path> -> nil` / `-> ok(len=N)`. Patch E only counted these
+                reads (`FSREAD`), so the file names were invisible.
+            G5  `src/fs.rs`, `Fs::read`: for the three files the v7 log shows the app
+                creating in its own container (`Documents/DnfSlot`, `Documents/DnfOpt`,
+                `Library/Preferences/com.nexonmobile.dnfswordman.plist`), a `FSBYTES` line
+                with the byte count and the first 32 bytes in hex, so "empty", "all zero"
+                and "has content" can be told apart at a glance. This one is read-side
+                only, as asked: if the app never reads one of the three, nothing prints
+                for it.
+
+          Line formats:
+
+          ```text
+          PATHJOIN ORIGIN base="<path>" component=<nil|empty> pc=0x<hex8> ret=0x<hex8>
+          NSDEFAULTS <selector> key="<key>" -> <nil|str(len=N)|<class name>>
+          NSREAD <NSString|NSData> <guest path> -> nil
+          NSREAD <NSString|NSData> <guest path> -> ok(len=<n>)
+          FSBYTES <guest path> len=<n> hex=<first 32 bytes, lowercase hex, '-' if empty>
+          ```
+
+          Log volume and the rate limit
+          ----------------------------
+          The v7 device log is 519-839 lines / 64-84 KB. Only `NSUserDefaults` can fire
+          every frame, so that is where the deduplication matters: a `(key, result)` pair
+          prints its first `DEFAULTS_HEAD = 8` calls in full and one call in
+          `DEFAULTS_SAMPLE = 100` afterwards, exactly as requested. The other three lines
+          are rare by nature (36 path joins, a handful of `NSData`/`NSString` reads, at
+          most three watched files), so they get a head budget of their own
+          (`ORIGIN_HEAD = 16` to stay paired with patch F's warning, which uses the same
+          16/25 failure policy; `READ_HEAD = 4`; `SPECIAL_HEAD = 4`). One shared global
+          backstop (`GLOBAL_BUDGET = 3000` lines, then one in `GLOBAL_SAMPLE = 100`)
+          bounds the case where an app produces thousands of *different* keys. The
+          per-key table is keyed by an FNV-1a hash and capped at `MAX_TRACKED_KEYS`, so an
+          event allocates nothing and the table cannot grow without bound.
+
+          Usage: python3 patch_originnil_v8.py [repo-root]   (default: current directory)
+
+          The script applies the edits by exact text replacement, refuses to run unless
+          every anchor matches the expected number of times, skips edits that are already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          LIB_RS = "src/lib.rs"
+          FS_ORIGIN = "src/fs_origin.rs"
+          FS_RS = "src/fs.rs"
+          NS_STRING = "src/frameworks/foundation/ns_string.rs"
+          NS_DATA = "src/frameworks/foundation/ns_data.rs"
+          NS_USER_DEFAULTS = "src/frameworks/foundation/ns_user_defaults.rs"
+
+          # The whole new module. Kept as one literal so the patch is a single, reviewable
+          # artifact and so "did the origin module change?" is a byte comparison.
+          FS_ORIGIN_RS = '''/*
+           * This Source Code Form is subject to the terms of the Mozilla Public
+           * License, v. 2.0. If a copy of the MPL was not distributed with this
+           * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+           */
+          //! Patch G (v8): the origin of the nil path component, of the nil defaults
+          //! value and of the whole-file read.
+          //!
+          //! Patch F (v7) found the shape of the failure: `-[NSString
+          //! stringByAppendingPathComponent:]` is called with a nil or empty component,
+          //! and because `string_by_appending_path_component` drops empty components,
+          //! `".../Documents"` + `""` stays `".../Documents"`. The app then opens that
+          //! *directory* as if it were a file and retries forever, so every image falls
+          //! back to a 1x1 placeholder texture and the screen stays black. What patch F
+          //! could not say is **which guest code produced the nil**. This module adds
+          //! that origin information, in four kinds of line:
+          //!
+          //! * [note_path_component_origin] is printed beside patch F's
+          //!   `PATHJOIN WARNING`, for the same call, and adds the guest program counter
+          //!   and the guest return address of the call that dropped the component, so
+          //!   the caller can be found in a disassembly of the app binary;
+          //! * [note_defaults_query] traces the `NSUserDefaults` key lookups
+          //!   (`objectForKey:`, `stringForKey:`, `arrayForKey:`, `dictionaryForKey:`,
+          //!   `boolForKey:`, `integerForKey:`) with the key and a one-token summary of
+          //!   the result. A `stringForKey:` that answers nil is the most likely source
+          //!   of a nil file name;
+          //! * [note_read_file] traces the whole-file string/data readers
+          //!   (`-[NSString initWithContentsOfFile:...]` and `-[NSData
+          //!   initWithContentsOfFile:]`, which the `+stringWithContentsOfFile:` and
+          //!   `+dataWithContentsOfFile:` class methods forward to) with the path and
+          //!   whether the read returned nil. Patch E's `FSREAD` line counts these calls,
+          //!   this one names them;
+          //! * [note_special_file] prints the length and the first [BYTES_PREFIX] bytes
+          //!   of the three files the v7 log shows the app creating in its own container
+          //!   (`Documents/DnfSlot`, `Documents/DnfOpt` and
+          //!   `Library/Preferences/com.nexonmobile.dnfswordman.plist`), so an empty file
+          //!   and an all-zero file can be told apart at a glance.
+          //!
+          //! Like patch F this is a pure logger: every function only decides whether to
+          //! print and then logs, it takes no state of the emulated program, and no value
+          //! or branch of a caller depends on anything here. It is a module of its own so
+          //! that patch F's module and its rate limit stay exactly as v7 had them.
+          //!
+          //! Line formats (short and greppable on purpose):
+          //!
+          //! ```text
+          //! PATHJOIN ORIGIN base="<path>" component=<nil|empty> pc=0x<hex> ret=0x<hex>
+          //! NSDEFAULTS <selector> key="<key>" -> <nil|str(len=N)|<class name>>
+          //! NSREAD <NSString|NSData> <guest path> -> nil
+          //! NSREAD <NSString|NSData> <guest path> -> ok(len=<n>)
+          //! FSBYTES <guest path> len=<n> hex=<first 32 bytes, lowercase hex, '-' if empty>
+          //! ```
+          //!
+          //! The rate limit is described at [should_print] and in the patch's docstring:
+          //! eight full lines per `NSUserDefaults` `(key, result)` pair and one in a
+          //! hundred afterwards, small head budgets for the three rare line kinds, and a
+          //! global backstop for an app that produces thousands of different keys.
+
+          use std::collections::HashMap;
+          use std::sync::atomic::{AtomicU32, Ordering};
+          use std::sync::{Mutex, OnceLock};
+
+          /// Full lines per `NSUserDefaults` `(key, result)` pair before sampling starts.
+          ///
+          /// A defaults lookup can run every frame (the app reads its own preferences
+          /// while it initialises), and the same key answering the same thing is not new
+          /// information after a few lines. Eight is enough to see the first decisions of
+          /// a run in context.
+          const DEFAULTS_HEAD: u32 = 8;
+          /// After the head, one call in this many prints, per `(key, result)` pair.
+          const DEFAULTS_SAMPLE: u32 = 100;
+
+          /// Full lines per path for [note_path_component_origin].
+          ///
+          /// Deliberately the same shape as patch F's `PATHJOIN WARNING` failure policy
+          /// (16 then 1 in 25) so this line stays paired with the warning it belongs to:
+          /// both are driven by the same `if` in `stringByAppendingPathComponent:`.
+          const ORIGIN_HEAD: u32 = 16;
+          const ORIGIN_SAMPLE: u32 = 25;
+
+          /// Full lines per path for [note_read_file]: a whole-file read is a rare event
+          /// (the v6 log has nine of them for a whole run), so a small head is plenty.
+          const READ_HEAD: u32 = 4;
+          const READ_SAMPLE: u32 = 100;
+
+          /// Full lines per path for [note_special_file]. Only three paths are watched,
+          /// so this is a formality; it exists so a path that *is* read every frame
+          /// cannot flood the log.
+          const SPECIAL_HEAD: u32 = 4;
+          const SPECIAL_SAMPLE: u32 = 100;
+
+          /// How many bytes of a watched file [note_special_file] prints.
+          const BYTES_PREFIX: usize = 32;
+
+          /// Backstop for the case the per-key budget cannot bound: an app producing
+          /// thousands of *different* keys. After this many patch G lines (all kinds
+          /// together) only one event in [GLOBAL_SAMPLE] prints.
+          const GLOBAL_BUDGET: u32 = 3000;
+          const GLOBAL_SAMPLE: u32 = 100;
+          /// Number of distinct keys the rate-limit table remembers. Entries are keyed by
+          /// a hash, so the table never keeps a copy of a key and stays small.
+          const MAX_TRACKED_KEYS: usize = 4096;
+
+          /// The three files the app creates in its own container and, per the v7 log,
+          /// never reads back. Matched on the last path component, which is what survives
+          /// every spelling the app uses (`<App>/Documents/DnfSlot`,
+          /// `<App>/Library/Preferences/com.nexonmobile.dnfswordman.plist`).
+          const WATCHED_FILES: [&str; 3] = ["DnfSlot", "DnfOpt", "com.nexonmobile.dnfswordman.plist"];
+
+          /// Patch G lines printed so far (all kinds), for the global backstop.
+          static LINES: AtomicU32 = AtomicU32::new(0);
+
+          fn key_table() -> &'static Mutex<HashMap<u64, u32>> {
+              static TABLE: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+              TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+          }
+
+          /// FNV-1a hash of the parts that identify one event, with a separator between
+          /// them so `("ab", "c")` and `("a", "bc")` cannot collide.
+          ///
+          /// An event can happen every frame, so the identity is hashed instead of being
+          /// stored: no allocation per event and a bounded table entry.
+          fn event_hash(parts: &[&str]) -> u64 {
+              let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+              for part in parts {
+                  for byte in part.as_bytes() {
+                      hash ^= *byte as u64;
+                      hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                  }
+                  hash ^= 0x1f;
+                  hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+              }
+              hash
+          }
+
+          /// Decides whether one event should print a line.
+          ///
+          /// `key` identifies the event: its first element is the line kind, the rest is
+          /// what makes two events of that kind different (a path, or a defaults key plus
+          /// the summary of its result). Two levels are combined and both must agree:
+          ///
+          /// * per key - the first `head` calls print in full, then one call in `sample`;
+          /// * globally - after [GLOBAL_BUDGET] lines only one event in [GLOBAL_SAMPLE]
+          ///   prints, which bounds the "thousands of different keys" case that a per-key
+          ///   budget alone cannot.
+          fn should_print(key: &[&str], head: u32, sample: u32) -> bool {
+              let global = LINES.fetch_add(1, Ordering::Relaxed);
+              if global >= GLOBAL_BUDGET && global % GLOBAL_SAMPLE != 0 {
+                  return false;
+              }
+              let Ok(mut table) = key_table().lock() else {
+                  // The lock can only be poisoned by a panic while it is held, and the
+                  // critical section below only touches the map. If it ever is poisoned,
+                  // the global backstop above is still enforced and everything prints.
+                  return true;
+              };
+              let hash = event_hash(key);
+              if table.len() >= MAX_TRACKED_KEYS && !table.contains_key(&hash) {
+                  // Out of room: this key keeps no budget of its own and is governed by
+                  // the global backstop above.
+                  return true;
+              }
+              let seen = table.entry(hash).or_insert(0);
+              let this = *seen;
+              *seen = this.saturating_add(1);
+              this < head || this % sample == 0
+          }
+
+          /// The first `max` bytes of `bytes` as lowercase hex, or `-` when empty.
+          fn hex_prefix(bytes: &[u8], max: usize) -> String {
+              const DIGITS: &[u8; 16] = b"0123456789abcdef";
+              let head = if bytes.len() > max { &bytes[..max] } else { bytes };
+              let mut out = String::with_capacity(head.len() * 2 + 1);
+              for byte in head {
+                  out.push(DIGITS[(byte >> 4) as usize] as char);
+                  out.push(DIGITS[(byte & 0x0f) as usize] as char);
+              }
+              if out.is_empty() {
+                  out.push('-');
+              }
+              out
+          }
+
+          /// True for the three files in [WATCHED_FILES].
+          fn is_watched_file(path: &str) -> bool {
+              match path.rsplit('/').next() {
+                  Some(name) => WATCHED_FILES.contains(&name),
+                  None => false,
+              }
+          }
+
+          /// `-[NSString stringByAppendingPathComponent:]` with a nil or empty component:
+          /// where the call came from.
+          ///
+          /// Printed beside patch F's `PATHJOIN WARNING` for the same call. `pc` is the
+          /// guest program counter while the host method runs, i.e. the instruction after
+          /// the `svc` that entered the host (the same value patch F prints for a failed
+          /// `open()`); `ret` is the guest link register, i.e. the address the guest
+          /// returns to. Those two addresses locate the caller in a disassembly of the
+          /// app binary, which is how "what was the file name supposed to be?" is
+          /// answered.
+          pub fn note_path_component_origin(base: &str, component_is_nil: bool, pc: u32, ret: u32) {
+              if !should_print(&["pathjoin", base], ORIGIN_HEAD, ORIGIN_SAMPLE) {
+                  return;
+              }
+              log!(
+                  "PATHJOIN ORIGIN base={:?} component=<{}> pc={:#010x} ret={:#010x}",
+                  base,
+                  if component_is_nil { "nil" } else { "empty" },
+                  pc,
+                  ret
+              );
+          }
+
+          /// An `NSUserDefaults` key lookup.
+          ///
+          /// `selector` is the method the app called, `key` the defaults key and
+          /// `summary` a one-token description of the value that came back: `nil`,
+          /// `str(len=N)` for an `NSString`, or the class name (`NSNumber`, `NSArray`,
+          /// ...). A `stringForKey:` that answers nil is the most likely origin of a nil
+          /// file-name component. Every typed getter forwards to `objectForKey:`, so one
+          /// query can print two lines (the typed getter and the shared lookup) - on
+          /// purpose, so the wrapper and the shared path can be told apart. Rate limit:
+          /// per `(key, result)` pair, see [DEFAULTS_HEAD] and [DEFAULTS_SAMPLE].
+          pub fn note_defaults_query(selector: &str, key: &str, summary: &str) {
+              if !should_print(&["defaults", key, summary], DEFAULTS_HEAD, DEFAULTS_SAMPLE) {
+                  return;
+              }
+              log!("NSDEFAULTS {} key={:?} -> {}", selector, key, summary);
+          }
+
+          /// A whole-file read: `-[NSString initWithContentsOfFile:...]` or
+          /// `-[NSData initWithContentsOfFile:]`.
+          ///
+          /// `size` is the number of bytes that were read, or `None` when the read failed
+          /// and the method returned nil. Patch E counts these calls (`FSREAD ok` /
+          /// `FSREAD ERR`); this line names the file, which is what the v6 log was
+          /// missing.
+          pub fn note_read_file(kind: &str, path: &str, size: Option<usize>) {
+              if !should_print(&["read", kind, path], READ_HEAD, READ_SAMPLE) {
+                  return;
+              }
+              match size {
+                  Some(size) => log!("NSREAD {} {} -> ok(len={})", kind, path, size),
+                  None => log!("NSREAD {} {} -> nil", kind, path),
+              }
+          }
+
+          /// One of the three watched files being read: length and first
+          /// [BYTES_PREFIX] bytes.
+          ///
+          /// Called from `Fs::read` for every guest read; a path that is not one of
+          /// [WATCHED_FILES] returns before it is hashed or logged, so the cost for every
+          /// other read is a suffix comparison on the last path component.
+          pub fn note_special_file(path: &str, bytes: &[u8]) {
+              if !is_watched_file(path) {
+                  return;
+              }
+              if !should_print(&["bytes", path], SPECIAL_HEAD, SPECIAL_SAMPLE) {
+                  return;
+              }
+              log!(
+                  "FSBYTES {} len={} hex={}",
+                  path,
+                  bytes.len(),
+                  hex_prefix(bytes, BYTES_PREFIX)
+              );
+          }
+          '''
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, markers that prove the replacement landed), where a
+          # marker only has to be *present*: three of the edits below insert the same two
+          # statements into three different methods, so a per-edit occurrence count cannot
+          # be exact. Exactness ("each line landed the stated number of times") is checked
+          # once, at the end, by EXACT_CHECKS below - and again by the v8 self-check.
+          EDITS = [
+              (
+                  "G0 lib.rs declares the origin-tracing module",
+                  LIB_RS,
+                  """mod fs;
+          mod fs_probe;
+          """,
+                  """mod fs;
+          mod fs_origin;
+          mod fs_probe;
+          """,
+                  1,
+                  ("mod fs_origin;",),
+              ),
+              (
+                  "G2 stringByAppendingPathComponent: logs where the call came from",
+                  NS_STRING,
+                  """    if component.is_null() || component_str.is_empty() {
+                  crate::fs_probe::note_path_component(&base_str, component.is_null());
+              }
+          """,
+                  """    if component.is_null() || component_str.is_empty() {
+                  crate::fs_probe::note_path_component(&base_str, component.is_null());
+                  // Patch G (v8): WHERE this call came from. Patch F's warning above says
+                  // which path lost a component; this line says which guest code lost it.
+                  // `pc` is the guest program counter while the host method runs (the
+                  // instruction after the `svc` that entered the host, the value patch F
+                  // prints for a failed open) and `ret` is the guest link register, i.e.
+                  // the address the guest returns to. Log only: no local is introduced,
+                  // and nothing here is read by a branch.
+                  crate::fs_origin::note_path_component_origin(
+                      &base_str,
+                      component.is_null(),
+                      env.cpu.pc_with_thumb_bit().addr_with_thumb_bit(),
+                      env.cpu.regs()[crate::cpu::Cpu::LR],
+                  );
+              }
+          """,
+                  1,
+                  ("crate::fs_origin::note_path_component_origin(",),
+              ),
+              (
+                  "G4a NSString initWithContentsOfFile: names the file it read",
+                  NS_STRING,
+                  """- (id)initWithContentsOfFile:(id)path {
+              if path == nil {
+                  release(env, this);
+                  return nil;
+              }
+              let path_str = to_rust_string(env, path);
+              let bytes = match env.fs.read(GuestPath::new(&path_str)) {
+                  Ok(b) => b,
+                  Err(_) => {
+                      println!("WARNING: File not found: {}, returning nil", path_str);
+                      release(env, this);
+                      return nil;
+                  }
+              };
+          """,
+                  """- (id)initWithContentsOfFile:(id)path {
+              if path == nil {
+                  release(env, this);
+                  return nil;
+              }
+              let path_str = to_rust_string(env, path);
+              let bytes = match env.fs.read(GuestPath::new(&path_str)) {
+                  Ok(b) => b,
+                  Err(_) => {
+                      println!("WARNING: File not found: {}, returning nil", path_str);
+                      // Patch G (v8): patch E counts failed reads, it does not name them.
+                      crate::fs_origin::note_read_file("NSString", &path_str, None);
+                      release(env, this);
+                      return nil;
+                  }
+              };
+              // Patch G (v8): the same line for the success case, so "returned nil" and
+              // "read N bytes" are both on the record. `bytes` is still owned here; the
+              // value that is decoded below is unchanged.
+              crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));
+          """,
+                  1,
+                  ('crate::fs_origin::note_read_file("NSString", &path_str, None);',),
+              ),
+              (
+                  "G4b NSString initWithContentsOfFile:encoding:error: names the file it read",
+                  NS_STRING,
+                  """- (id)initWithContentsOfFile:(id)path encoding:(NSStringEncoding)encoding error:(MutPtr<id>)error {
+              if path == nil {
+                  release(env, this);
+                  return nil;
+              }
+              let path_str = to_rust_string(env, path);
+              let bytes = match env.fs.read(GuestPath::new(&path_str)) {
+                  Ok(b) => b,
+                  Err(_) => {
+                      println!("WARNING: File not found: {}, returning nil", path_str);
+                      if !error.is_null() {
+                          env.mem.write(error, nil);
+                      }
+                      release(env, this);
+                      return nil;
+                  }
+              };
+          """,
+                  """- (id)initWithContentsOfFile:(id)path encoding:(NSStringEncoding)encoding error:(MutPtr<id>)error {
+              if path == nil {
+                  release(env, this);
+                  return nil;
+              }
+              let path_str = to_rust_string(env, path);
+              let bytes = match env.fs.read(GuestPath::new(&path_str)) {
+                  Ok(b) => b,
+                  Err(_) => {
+                      println!("WARNING: File not found: {}, returning nil", path_str);
+                      // Patch G (v8): patch E counts failed reads, it does not name them.
+                      crate::fs_origin::note_read_file("NSString", &path_str, None);
+                      if !error.is_null() {
+                          env.mem.write(error, nil);
+                      }
+                      release(env, this);
+                      return nil;
+                  }
+              };
+              // Patch G (v8): the success case, same as in the initialiser above.
+              crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));
+          """,
+                  1,
+                  ('crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));',),
+              ),
+              (
+                  "G4c NSString initWithContentsOfFile:usedEncoding:error: names the file it read",
+                  NS_STRING,
+                  """- (id)initWithContentsOfFile:(id)path usedEncoding:(MutPtr<NSUInteger>)enc error:(MutPtr<id>)error {
+              if path == nil {
+                  release(env, this);
+                  return nil;
+              }
+              let path_str = to_rust_string(env, path);
+              let bytes = match env.fs.read(GuestPath::new(&path_str)) {
+                  Ok(b) => b,
+                  Err(_) => {
+                      println!("WARNING: File not found: {}, returning nil", path_str);
+                      if !error.is_null() {
+                          env.mem.write(error, nil);
+                      }
+                      release(env, this);
+                      return nil;
+                  }
+              };
+          """,
+                  """- (id)initWithContentsOfFile:(id)path usedEncoding:(MutPtr<NSUInteger>)enc error:(MutPtr<id>)error {
+              if path == nil {
+                  release(env, this);
+                  return nil;
+              }
+              let path_str = to_rust_string(env, path);
+              let bytes = match env.fs.read(GuestPath::new(&path_str)) {
+                  Ok(b) => b,
+                  Err(_) => {
+                      println!("WARNING: File not found: {}, returning nil", path_str);
+                      // Patch G (v8): patch E counts failed reads, it does not name them.
+                      crate::fs_origin::note_read_file("NSString", &path_str, None);
+                      if !error.is_null() {
+                          env.mem.write(error, nil);
+                      }
+                      release(env, this);
+                      return nil;
+                  }
+              };
+              // Patch G (v8): the success case, same as in the initialisers above. The
+              // `enc` out-parameter written further down is unchanged.
+              crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));
+          """,
+                  1,
+                  ("crate::fs_origin::note_read_file(\"NSString\", &path_str, Some(bytes.len()));",),
+              ),
+              (
+                  "G4d NSData initWithContentsOfFile: names the file it read",
+                  NS_DATA,
+                  """    let path_str = to_rust_string(env, path);
+              let Ok(bytes) = env.fs.read(GuestPath::new(&path_str)) else {
+                  log_dbg!("NSData: Failed to read file at {:?}", path_str);
+                  release(env, this);
+                  return nil;
+              };
+          """,
+                  """    let path_str = to_rust_string(env, path);
+              let Ok(bytes) = env.fs.read(GuestPath::new(&path_str)) else {
+                  log_dbg!("NSData: Failed to read file at {:?}", path_str);
+                  // Patch G (v8): the data reads of a run were only visible as a counter
+                  // in patch E's summary; this line names the file.
+                  crate::fs_origin::note_read_file("NSData", &path_str, None);
+                  release(env, this);
+                  return nil;
+              };
+              // Patch G (v8): the success case. `size` below is computed from the same
+              // `bytes`, and the 0-byte early return is unchanged.
+              crate::fs_origin::note_read_file("NSData", &path_str, Some(bytes.len()));
+          """,
+                  1,
+                  ('crate::fs_origin::note_read_file("NSData", &path_str, None);',),
+              ),
+              (
+                  "G5 Fs::read dumps the three watched files",
+                  FS_RS,
+                  """        crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);
+                  result
+          """,
+                  """        crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);
+                  // Patch G (v8): the three files the app creates in its own container
+                  // (Documents/DnfSlot, Documents/DnfOpt and its preferences plist) are
+                  // the only writes that succeed in the v7 log, and it never reads two of
+                  // them back. Their bytes say whether the app wrote something the game
+                  // can use or an empty file. `note_special_file` returns immediately for
+                  // every other path. Log only; `result` and `read_inner` are untouched.
+                  if let Ok(bytes) = result.as_ref() {
+                      crate::fs_origin::note_special_file(path.as_ref().as_str(), bytes);
+                  }
+                  result
+          """,
+                  1,
+                  ("crate::fs_origin::note_special_file(path.as_ref().as_str(), bytes);",),
+              ),
+              (
+                  "G3a objectForKey: logs the key and the result",
+                  NS_USER_DEFAULTS,
+                  """    let registration_domain_dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).registration_domain_dict;
+              msg![env; registration_domain_dict objectForKey:key]
+          }
+          """,
+                  """    let registration_domain_dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).registration_domain_dict;
+              // Patch G (v8): the value this method is about to return, bound to a local
+              // so the trace can name it. Every other `NSUserDefaults` getter forwards to
+              // this method, so this line is the shared lookup path: a key that answers
+              // nil here is a key the app has no default for. The two early returns above
+              // are unchanged, and `res` is the same message send as before.
+              let res = msg![env; registration_domain_dict objectForKey:key];
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_query("objectForKey:", &key_str, &defaults_value_summary(env, res));
+              res
+          }
+          """,
+                  1,
+                  ('crate::fs_origin::note_defaults_query("objectForKey:", &key_str, &defaults_value_summary(env, res));',),
+              ),
+              (
+                  "G3b stringForKey: logs the key and the result",
+                  NS_USER_DEFAULTS,
+                  """- (id)stringForKey:(id)key {
+              log_dbg!("NSUserDefaults stringForKey:{}", to_rust_string(env, key));
+              let val: id = msg![env; this objectForKey:key];
+          """,
+                  """- (id)stringForKey:(id)key {
+              log_dbg!("NSUserDefaults stringForKey:{}", to_rust_string(env, key));
+              let val: id = msg![env; this objectForKey:key];
+              // Patch G (v8): logged before the nil check below, so a key that has no
+              // value at all is visible. `val` is the value the method goes on to return
+              // (or to convert), and nothing here changes it.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_query("stringForKey:", &key_str, &defaults_value_summary(env, val));
+          """,
+                  1,
+                  ('crate::fs_origin::note_defaults_query("stringForKey:", &key_str, &defaults_value_summary(env, val));',),
+              ),
+              (
+                  "G3c arrayForKey: logs the key and the result",
+                  NS_USER_DEFAULTS,
+                  """- (id)arrayForKey:(id)key {
+              log_dbg!("NSUserDefaults arrayForKey:{}", to_rust_string(env, key));
+              let val: id = msg![env; this objectForKey:key];
+          """,
+                  """- (id)arrayForKey:(id)key {
+              log_dbg!("NSUserDefaults arrayForKey:{}", to_rust_string(env, key));
+              let val: id = msg![env; this objectForKey:key];
+              // Patch G (v8): logged before the nil check below, same as stringForKey:.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_query("arrayForKey:", &key_str, &defaults_value_summary(env, val));
+          """,
+                  1,
+                  ('crate::fs_origin::note_defaults_query("arrayForKey:", &key_str, &defaults_value_summary(env, val));',),
+              ),
+              (
+                  "G3d dictionaryForKey: logs the key and the result",
+                  NS_USER_DEFAULTS,
+                  """- (id)dictionaryForKey:(id)key {
+              let val: id = msg![env; this objectForKey:key];
+          """,
+                  """- (id)dictionaryForKey:(id)key {
+              let val: id = msg![env; this objectForKey:key];
+              // Patch G (v8): logged before the nil check below, same as stringForKey:.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_query("dictionaryForKey:", &key_str, &defaults_value_summary(env, val));
+          """,
+                  1,
+                  ('crate::fs_origin::note_defaults_query("dictionaryForKey:", &key_str, &defaults_value_summary(env, val));',),
+              ),
+              (
+                  "G3e boolForKey: logs the key and the result",
+                  NS_USER_DEFAULTS,
+                  """- (bool)boolForKey:(id)key { // NSString *
+              let val: id = msg![env; this objectForKey:key];
+          """,
+                  """- (bool)boolForKey:(id)key { // NSString *
+              let val: id = msg![env; this objectForKey:key];
+              // Patch G (v8): the object the answer is derived from, before the nil check
+              // below turns "no default" into `false`. The returned bool is unchanged.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_query("boolForKey:", &key_str, &defaults_value_summary(env, val));
+          """,
+                  1,
+                  ('crate::fs_origin::note_defaults_query("boolForKey:", &key_str, &defaults_value_summary(env, val));',),
+              ),
+              (
+                  "G3f integerForKey: logs the key and the result",
+                  NS_USER_DEFAULTS,
+                  """    let val: id = msg![env; this objectForKey:key];
+              if val == nil {
+                  return 0;
+              }
+          """,
+                  """    let val: id = msg![env; this objectForKey:key];
+              // Patch G (v8): the object the answer is derived from, before the nil check
+              // below turns "no default" into `0`. The returned integer is unchanged.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_query("integerForKey:", &key_str, &defaults_value_summary(env, val));
+              if val == nil {
+                  return 0;
+              }
+          """,
+                  1,
+                  ('crate::fs_origin::note_defaults_query("integerForKey:", &key_str, &defaults_value_summary(env, val));',),
+              ),
+              (
+                  "G3g the one-token defaults value summary",
+                  NS_USER_DEFAULTS,
+                  """@end
+
+          };
+          """,
+                  """@end
+
+          };
+
+          /// Patch G (v8): the defaults key of a lookup, as text.
+          ///
+          /// A key is only *conventionally* an `NSString`, and `to_rust_string` assumes
+          /// it really is one (it borrows the string host object and unwraps the UTF-8
+          /// conversion), so anything that is not an `NSString` is described by its class
+          /// instead of being converted. The trace must not be able to turn a call that
+          /// works today into a warning or a panic.
+          fn defaults_key_string(env: &mut Environment, key: id) -> String {
+              if key == nil {
+                  return "nil".to_owned();
+              }
+              let key_class: Class = msg![env; key class];
+              let ns_string_class = env.objc.get_known_class("NSString", &mut env.mem);
+              if env.objc.class_is_subclass_of(key_class, ns_string_class) {
+                  return to_rust_string(env, key).into_owned();
+              }
+              let class_name = env
+                  .objc
+                  .try_get_class_name(key_class)
+                  .unwrap_or("<unknown>")
+                  .to_owned();
+              format!("<{}>", class_name)
+          }
+
+          /// Patch G (v8): a one-token summary of an `NSUserDefaults` value, for the
+          /// trace above: `nil`, `str(len=N)` for an `NSString`, or the class name for
+          /// everything else (`NSNumber`, `NSArray`, `NSDictionary`, ...).
+          ///
+          /// Read-only: it asks the object for its class and, for a string, for its
+          /// length. No value is changed, and no branch of the method that calls it
+          /// depends on the result.
+          fn defaults_value_summary(env: &mut Environment, val: id) -> String {
+              if val == nil {
+                  return "nil".to_owned();
+              }
+              let val_class: Class = msg![env; val class];
+              let class_name = env
+                  .objc
+                  .try_get_class_name(val_class)
+                  .unwrap_or("<unknown>")
+                  .to_owned();
+              let ns_string_class = env.objc.get_known_class("NSString", &mut env.mem);
+              if env.objc.class_is_subclass_of(val_class, ns_string_class) {
+                  let len: u32 = msg![env; val length];
+                  return format!("str(len={})", len);
+              }
+              class_name
+          }
+          """,
+                  1,
+                  ("fn defaults_value_summary(env: &mut Environment, val: id) -> String",),
+              ),
+          ]
+
+
+          # (file, marker, occurrences) - the exact final counts of every line patch G
+          # inserts. This is the patch-script half of the counts the v8 self-check asserts
+          # against the built tree.
+          EXACT_CHECKS = (
+              (LIB_RS, "mod fs_origin;", 1),
+              (FS_ORIGIN, "pub fn note_path_component_origin(base: &str, component_is_nil: bool, pc: u32, ret: u32)", 1),
+              (FS_ORIGIN, "pub fn note_defaults_query(selector: &str, key: &str, summary: &str)", 1),
+              (FS_ORIGIN, "pub fn note_read_file(kind: &str, path: &str, size: Option<usize>)", 1),
+              (FS_ORIGIN, "pub fn note_special_file(path: &str, bytes: &[u8])", 1),
+              (NS_STRING, "crate::fs_origin::note_path_component_origin(", 1),
+              (NS_STRING, 'crate::fs_origin::note_read_file("NSString", &path_str, None);', 3),
+              (NS_STRING, 'crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));', 3),
+              (NS_DATA, 'crate::fs_origin::note_read_file("NSData", &path_str, None);', 1),
+              (NS_DATA, 'crate::fs_origin::note_read_file("NSData", &path_str, Some(bytes.len()));', 1),
+              (FS_RS, "crate::fs_origin::note_special_file(path.as_ref().as_str(), bytes);", 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_query("objectForKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_query("stringForKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_query("arrayForKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_query("dictionaryForKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_query("boolForKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_query("integerForKey:", ', 1),
+              (NS_USER_DEFAULTS, "fn defaults_value_summary(env: &mut Environment, val: id) -> String", 1),
+              (NS_USER_DEFAULTS, "fn defaults_key_string(env: &mut Environment, key: id) -> String", 1),
+          )
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def balance(text):
+              return text.count("{") == text.count("}")
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              targets = sorted({edit[1] for edit in EDITS} | {FS_ORIGIN})
+              texts = {}
+              for target in targets:
+                  path = repo / target
+                  if path.is_file():
+                      texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                  elif target == FS_ORIGIN:
+                      texts[target] = None
+                  else:
+                      fail("{} does not exist".format(path))
+
+              # G1: the new module. Unlike the other files it is created rather than
+              # edited, so idempotency is "is it already there?" plus "is the existing
+              # copy one the patch can recognise?".
+              if texts[FS_ORIGIN] is None:
+                  if not balance(FS_ORIGIN_RS):
+                      fail("the origin module the script carries is brace-unbalanced")
+                  texts[FS_ORIGIN] = FS_ORIGIN_RS
+                  print("created: G1 {} ({} bytes)".format(FS_ORIGIN, len(FS_ORIGIN_RS)))
+              elif "pub fn note_path_component_origin(base: &str, component_is_nil: bool, pc: u32, ret: u32)" in texts[FS_ORIGIN]:
+                  print("already applied: G1 {} (leaving the existing copy alone)".format(FS_ORIGIN))
+              else:
+                  fail("{} already exists but does not look like the origin module; refusing to overwrite".format(FS_ORIGIN))
+
+              for name, target, old, new, occurrences, markers in EDITS:
+                  text = texts[target]
+                  if new in text:
+                      # The replacement text is already there, so this edit has run. This
+                      # is a more precise test than "is the anchor gone?": an edit that
+                      # only inserts a statement leaves its anchor in place.
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  if old not in text:
+                      fail("{}: neither the anchor nor the replacement of \"{}\" is present; "
+                           "this is not a tree patch G recognises".format(target, name))
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  for marker in markers:
+                      if marker not in replaced:
+                          fail("{}: \"{}\" did not land ({!r} is missing)".format(target, name, marker))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              # Every line patch G inserts, with its exact final count.
+              for target, marker, expected in EXACT_CHECKS:
+                  found = texts[target].count(marker)
+                  if found != expected:
+                      fail("post-condition failed: {} contains {} occurrence(s) of {!r}, expected {}".format(
+                          target, found, marker, expected))
+
+              for target, text in texts.items():
+                  if not balance(text):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+              # Patch G must not have changed a single line patches A-F inserted. The
+              # cheapest proof is the markers the v8 self-check asserts; the load-bearing
+              # ones at the sites patch G also touches are re-checked here, together with
+              # the G lines that share them.
+              ns_string = texts[NS_STRING]
+              for name, marker, expected in (
+                  ("F5 path-join warning", "crate::fs_probe::note_path_component(&base_str, component.is_null());", 1),
+                  ("G2 path-join origin", "crate::fs_origin::note_path_component_origin(", 1),
+                  ("G4a NSString failed read", 'crate::fs_origin::note_read_file("NSString", &path_str, None);', 3),
+                  ("G4b NSString successful read", 'crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));', 3),
+              ):
+                  if ns_string.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          NS_STRING, name, ns_string.count(marker), expected))
+              if texts[NS_STRING].count('println!("WARNING: File not found: {}, returning nil", path_str);') != 3:
+                  fail("{}: the three pre-existing file-not-found warnings are not intact".format(NS_STRING))
+              fs_rs = texts[FS_RS]
+              for name, marker, expected in (
+                  ("E5 read wrapper", "let bytes_read = result.as_ref().ok().map(|bytes| bytes.len());", 1),
+                  ("E5 read hook", "crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);", 1),
+                  ("F3 write hook", "crate::fs_probe::note_write_file(guest_path.as_str(), result.is_ok());", 1),
+                  ("G5 watched-file dump", "crate::fs_origin::note_special_file(path.as_ref().as_str(), bytes);", 1),
+              ):
+                  if fs_rs.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          FS_RS, name, fs_rs.count(marker), expected))
+              defaults = texts[NS_USER_DEFAULTS]
+              for selector in ("objectForKey:", "stringForKey:", "arrayForKey:",
+                               "dictionaryForKey:", "boolForKey:", "integerForKey:"):
+                  expected = 1
+                  found = defaults.count('crate::fs_origin::note_defaults_query("{}", '.format(selector))
+                  if found != expected:
+                      fail("{}: the {} trace appears {} time(s), expected {}".format(
+                          NS_USER_DEFAULTS, selector, found, expected))
+              if "let val: id = msg![env; this objectForKey:key];" not in defaults:
+                  fail("{}: the shared objectForKey: lookup is gone".format(NS_USER_DEFAULTS))
+              print("post-check: patch F's path-join warning, patch E's read wrapper and hook, "
+                    "patch F's write hook and the three pre-existing file-not-found warnings are "
+                    "untouched, and all six defaults traces, the read traces and the watched-file "
+                    "dump are in place")
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_G_PY
 
       - name: Check that the patches really landed
         run: |
           set -eu
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
           # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5), the
-          # file-access / texture-upload tracing (E, v6) and the filesystem probe / write
-          # tracing (F, v7).
+          # file-access / texture-upload tracing (E, v6), the filesystem probe / write
+          # tracing (F, v7) and the path-origin tracing (G, v8).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
           # sends the app's EUC-KR text through the UTF-8 default, still prints only the
-          # first texture upload of a run, or still cannot show the probe and write calls
-          # that explain a path which is opened over and over but is never a file.
+          # first texture upload of a run, still cannot show the probe and write calls
+          # that explain a path which is opened over and over but is never a file, or
+          # still cannot say which guest call produced the nil path component that turned
+          # that path into a directory.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -3387,6 +4346,244 @@ jobs:
                 "observe, never change, the emulated result")
           CHECK_FSPROBE
 
+          echo "== patch G (v8): where the nil path component comes from =="
+          # The four new functions, the five line formats, the rate-limit constants and
+          # the call site of every one of them. The counts are exact, so a duplicated or
+          # missing insertion fails the build. The A-F assertions above are unchanged: the
+          # v8 script is the v7 script with this section appended.
+          origin=src/fs_origin.rs
+          if [ ! -f "$origin" ]; then
+            echo "::error::patch G did not create $origin"
+            exit 1
+          fi
+          check_marker "$origin" "pub fn note_path_component_origin(base: &str, component_is_nil: bool, pc: u32, ret: u32)" 1
+          check_marker "$origin" "pub fn note_defaults_query(selector: &str, key: &str, summary: &str)" 1
+          check_marker "$origin" "pub fn note_read_file(kind: &str, path: &str, size: Option<usize>)" 1
+          check_marker "$origin" "pub fn note_special_file(path: &str, bytes: &[u8])" 1
+          check_marker "$origin" "PATHJOIN ORIGIN base={:?} component=<{}> pc={:#010x} ret={:#010x}" 1
+          check_marker "$origin" "NSDEFAULTS {} key={:?} -> {}" 1
+          check_marker "$origin" "NSREAD {} {} -> nil" 1
+          check_marker "$origin" "NSREAD {} {} -> ok(len={})" 1
+          check_marker "$origin" "FSBYTES {} len={} hex={}" 1
+          # The G1 rate limit: the defaults policy the task asked for (first 8 per
+          # key+result, then 1 in 100), the per-kind heads, and the three watched files.
+          check_marker "$origin" "const DEFAULTS_HEAD: u32 = 8;" 1
+          check_marker "$origin" "const DEFAULTS_SAMPLE: u32 = 100;" 1
+          check_marker "$origin" "const ORIGIN_HEAD: u32 = 16;" 1
+          check_marker "$origin" "const ORIGIN_SAMPLE: u32 = 25;" 1
+          check_marker "$origin" "const READ_HEAD: u32 = 4;" 1
+          check_marker "$origin" "const SPECIAL_HEAD: u32 = 4;" 1
+          check_marker "$origin" "const BYTES_PREFIX: usize = 32;" 1
+          check_marker "$origin" "const GLOBAL_BUDGET: u32 = 3000;" 1
+          check_marker "$origin" "const GLOBAL_SAMPLE: u32 = 100;" 1
+          check_marker "$origin" "const MAX_TRACKED_KEYS: usize = 4096;" 1
+          check_marker "$origin" 'const WATCHED_FILES: [&str; 3] = ["DnfSlot", "DnfOpt", "com.nexonmobile.dnfswordman.plist"];' 1
+          # Wiring: every new function has a real call site, and patch G never reaches
+          # into patch F's module (F's module and its rate limit stay as v7 had them).
+          check_marker src/lib.rs "mod fs_origin;" 1
+          check_marker "$origin" "fs_probe" 0
+          check_marker src/frameworks/foundation/ns_string.rs "crate::fs_origin::note_path_component_origin(" 1
+          check_marker src/frameworks/foundation/ns_string.rs 'crate::fs_origin::note_read_file("NSString", &path_str, None);' 3
+          check_marker src/frameworks/foundation/ns_string.rs 'crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));' 3
+          check_marker src/frameworks/foundation/ns_data.rs 'crate::fs_origin::note_read_file("NSData", &path_str, None);' 1
+          check_marker src/frameworks/foundation/ns_data.rs 'crate::fs_origin::note_read_file("NSData", &path_str, Some(bytes.len()));' 1
+          check_marker src/fs.rs "crate::fs_origin::note_special_file(path.as_ref().as_str(), bytes);" 1
+          defaults=src/frameworks/foundation/ns_user_defaults.rs
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_query("objectForKey:", &key_str, &defaults_value_summary(env, res));' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_query("stringForKey:", &key_str, &defaults_value_summary(env, val));' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_query("arrayForKey:", &key_str, &defaults_value_summary(env, val));' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_query("dictionaryForKey:", &key_str, &defaults_value_summary(env, val));' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_query("boolForKey:", &key_str, &defaults_value_summary(env, val));' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_query("integerForKey:", &key_str, &defaults_value_summary(env, val));' 1
+          check_marker "$defaults" "fn defaults_key_string(env: &mut Environment, key: id) -> String" 1
+          check_marker "$defaults" "fn defaults_value_summary(env: &mut Environment, val: id) -> String" 1
+          # Patch F's warning at the shared path-join site is still there exactly once:
+          # patch G adds its line beside it and changes nothing patch F inserted. Patch F
+          # asserts the same marker above, so this is the pairing stated twice on purpose.
+          check_marker src/frameworks/foundation/ns_string.rs "crate::fs_probe::note_path_component(&base_str, component.is_null());" 1
+
+          python3 - <<'CHECK_FSORIGIN'
+          import pathlib
+          import sys
+
+          # The checks a substring count cannot make: the origin line has to sit inside
+          # the path-join warn branch, after patch F's warning and before the call that
+          # drops the component; every defaults trace has to be able to see the value the
+          # getter acts on, i.e. after the lookup and before the nil check; the read
+          # traces have to be on both arms of the read; the watched-file dump has to be
+          # inside patch E's tracing wrapper and read_inner has to be untouched; and the
+          # origin module has to be incapable of changing emulation.
+          problems = []
+
+          origin = pathlib.Path("src/fs_origin.rs").read_text(encoding="utf-8")
+          nsstr = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
+          nsdata = pathlib.Path("src/frameworks/foundation/ns_data.rs").read_text(encoding="utf-8")
+          defaults = pathlib.Path("src/frameworks/foundation/ns_user_defaults.rs").read_text(encoding="utf-8")
+          fs = pathlib.Path("src/fs.rs").read_text(encoding="utf-8")
+          lib_rs = pathlib.Path("src/lib.rs").read_text(encoding="utf-8")
+
+          # G1: the origin module must be a pure logger, and it must not reach into patch
+          # F's module.
+          for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
+                      "std::process::", "std::fs::", "Environment", "env.", "fs_probe"):
+              if bad in origin:
+                  problems.append("src/fs_origin.rs: contains {!r}, which instrumentation must not use".format(bad))
+
+          # G2: the origin line, its position and its two addresses.
+          marker_warning = "crate::fs_probe::note_path_component(&base_str, component.is_null());"
+          marker_origin = "crate::fs_origin::note_path_component_origin("
+          marker_build = "let res = path_algorithms::string_by_appending_path_component"
+          append_impl = nsstr[nsstr.index("- (id)stringByAppendingPathComponent:(id)component {"):]
+          append_impl = append_impl[:append_impl.index("\n}")]
+          for needed in ("if component.is_null() || component_str.is_empty() {", marker_warning,
+                         marker_origin, marker_build):
+              if needed not in append_impl:
+                  problems.append("src/frameworks/foundation/ns_string.rs: {!r} is not in stringByAppendingPathComponent:".format(needed))
+          if marker_origin in append_impl and marker_warning in append_impl and marker_build in append_impl:
+              if not append_impl.index(marker_warning) < append_impl.index(marker_origin) < append_impl.index(marker_build):
+                  problems.append("src/frameworks/foundation/ns_string.rs: the origin line is not between patch F's "
+                                  "warning and the call that drops the component")
+              body = append_impl[append_impl.index(marker_origin):]
+              if "env.cpu.pc_with_thumb_bit().addr_with_thumb_bit()" not in body:
+                  problems.append("src/frameworks/foundation/ns_string.rs: the origin line does not carry the guest PC")
+              if "crate::cpu::Cpu::LR" not in body:
+                  problems.append("src/frameworks/foundation/ns_string.rs: the origin line does not carry the guest return address")
+
+          # G3: the six defaults lookups. Each trace must follow the lookup it reports and
+          # precede the nil check, so a key with no value at all is visible.
+          for head, selector, lookup in (
+              ("- (id)objectForKey:(id)key { // NSString*", "objectForKey:",
+               "let res = msg![env; registration_domain_dict objectForKey:key];"),
+              ("- (id)stringForKey:(id)key {", "stringForKey:", "let val: id = msg![env; this objectForKey:key];"),
+              ("- (id)arrayForKey:(id)key {", "arrayForKey:", "let val: id = msg![env; this objectForKey:key];"),
+              ("- (id)dictionaryForKey:(id)key {", "dictionaryForKey:", "let val: id = msg![env; this objectForKey:key];"),
+              ("- (bool)boolForKey:(id)key { // NSString *", "boolForKey:", "let val: id = msg![env; this objectForKey:key];"),
+              ("- (NSInteger)integerForKey:(id)key {", "integerForKey:", "let val: id = msg![env; this objectForKey:key];"),
+          ):
+              call = 'crate::fs_origin::note_defaults_query("{}", '.format(selector)
+              if head not in defaults:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} is missing".format(selector))
+                  continue
+              body = defaults[defaults.index(head):]
+              body = body[:body.index("\n}")]
+              if call not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} has no trace".format(selector))
+                  continue
+              if lookup not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: the {} lookup changed shape".format(selector))
+              elif body.index(lookup) > body.index(call):
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: the {} trace precedes its lookup".format(selector))
+              if "if val == nil" in body and body.index("if val == nil") < body.index(call):
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: the {} trace follows the nil check, so a "
+                                  "missing key would be invisible".format(selector))
+              if "let key_str = defaults_key_string(env, key);" not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not use the guarded key helper".format(selector))
+              if "&defaults_value_summary(env," not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not summarise its result".format(selector))
+
+          # G3g: the two helpers. `to_rust_string` is only used behind an NSString class
+          # check, because it borrows the string host object directly.
+          for needed in ("fn defaults_key_string(env: &mut Environment, key: id) -> String {",
+                         "fn defaults_value_summary(env: &mut Environment, val: id) -> String {"):
+              if needed not in defaults:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {!r} is missing".format(needed))
+          summary_impl = defaults[defaults.index("fn defaults_value_summary(env: &mut Environment, val: id) -> String {"):]
+          for needed in ('return "nil".to_owned();', 'format!("str(len={})", len)', "class_name"):
+              if needed not in summary_impl:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: the value summary cannot produce {!r}".format(needed))
+          key_impl = defaults[defaults.index("fn defaults_key_string(env: &mut Environment, key: id) -> String {"):]
+          key_impl = key_impl[:key_impl.index("\n}")]
+          if key_impl.index("class_is_subclass_of") > key_impl.index("to_rust_string"):
+              problems.append("src/frameworks/foundation/ns_user_defaults.rs: the key helper converts before it checks "
+                              "the class, so a non-string key could reach to_rust_string")
+
+          # G4: both arms of every whole-file reader.
+          for signature in ("- (id)initWithContentsOfFile:(id)path {",
+                            "- (id)initWithContentsOfFile:(id)path encoding:",
+                            "- (id)initWithContentsOfFile:(id)path usedEncoding:"):
+              body = nsstr[nsstr.index(signature):]
+              body = body[:body.index("\n}")]
+              none_call = 'crate::fs_origin::note_read_file("NSString", &path_str, None);'
+              some_call = 'crate::fs_origin::note_read_file("NSString", &path_str, Some(bytes.len()));'
+              for call in (none_call, some_call):
+                  if call not in body:
+                      problems.append("src/frameworks/foundation/ns_string.rs: {} has no {!r}".format(signature, call))
+              if none_call in body and "Err(_) => {" in body and "release(env, this);" in body:
+                  # rindex: these methods release the object again in their `path == nil`
+                  # early return, which comes before the match.
+                  if not body.index("Err(_) => {") < body.index(none_call) < body.rindex("release(env, this);"):
+                      problems.append("src/frameworks/foundation/ns_string.rs: the failed-read trace of {} is not in the "
+                                      "failure arm".format(signature))
+              if some_call in body:
+                  if body.index(some_call) < body.index("    };"):
+                      problems.append("src/frameworks/foundation/ns_string.rs: the successful-read trace of {} is inside the "
+                                      "match instead of after it".format(signature))
+                  uses = [position for position in (body.find("Cow::Owned(bytes)"), body.find("let len = bytes.len();"))
+                          if position != -1]
+                  if uses and body.index(some_call) > min(uses):
+                      problems.append("src/frameworks/foundation/ns_string.rs: the successful-read trace of {} follows the "
+                                      "first use of bytes".format(signature))
+
+          data_body = nsdata[nsdata.index("- (id)initWithContentsOfFile:(id)path {"):]
+          data_body = data_body[:data_body.index("\n}")]
+          for call in ('crate::fs_origin::note_read_file("NSData", &path_str, None);',
+                       'crate::fs_origin::note_read_file("NSData", &path_str, Some(bytes.len()));'):
+              if call not in data_body:
+                  problems.append("src/frameworks/foundation/ns_data.rs: initWithContentsOfFile: has no {!r}".format(call))
+          if 'crate::fs_origin::note_read_file("NSData", &path_str, None);' in data_body:
+              if not data_body.index("let Ok(bytes) = env.fs.read") < data_body.index('crate::fs_origin::note_read_file("NSData", &path_str, None);') < data_body.rindex("release(env, this);"):
+                  problems.append("src/frameworks/foundation/ns_data.rs: the failed-read trace is not in the failure arm")
+
+          # G5: the watched-file dump is inside patch E's wrapper, after its counter and
+          # before the value is returned, and read_inner is byte for byte the old body.
+          wrapper = fs[fs.index("pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {"):]
+          wrapper = wrapper[:wrapper.index("\n    }")]
+          order = ["crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);",
+                   "if let Ok(bytes) = result.as_ref() {",
+                   "crate::fs_origin::note_special_file(path.as_ref().as_str(), bytes);",
+                   "\n        result"]
+          for needed in order:
+              if needed not in wrapper:
+                  problems.append("src/fs.rs: Fs::read has no {!r}".format(needed))
+          if all(needed in wrapper for needed in order):
+              positions = [wrapper.index(needed) for needed in order]
+              if positions != sorted(positions):
+                  problems.append("src/fs.rs: the watched-file dump does not sit between patch E's counter and the return")
+          inner = fs[fs.index("fn read_inner<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {"):]
+          inner = inner[:inner.index("\n    }")]
+          for line in ("        let mut file = self.open(path.as_ref())?;",
+                       "        let mut result = Vec::new();",
+                       "        file.read_to_end(&mut result).map_err(|_| ())?;",
+                       "        Ok(result)"):
+              if line not in inner:
+                  problems.append("src/fs.rs: read_inner lost the pre-patch line {!r}".format(line))
+          if "fs_origin" in inner:
+              problems.append("src/fs.rs: patch G touched read_inner")
+
+          # G0: the module is declared after the log macro and beside patch F's module.
+          if not lib_rs.index("mod log;") < lib_rs.index("mod fs_origin;") < lib_rs.index("mod fs_probe;"):
+              problems.append("src/lib.rs: mod fs_origin; is not between mod log; and mod fs_probe;")
+
+          for name in ("src/lib.rs", "src/fs.rs", "src/fs_origin.rs",
+                       "src/frameworks/foundation/ns_string.rs",
+                       "src/frameworks/foundation/ns_data.rs",
+                       "src/frameworks/foundation/ns_user_defaults.rs"):
+              content = pathlib.Path(name).read_text(encoding="utf-8")
+              if content.count("{") != content.count("}"):
+                  problems.append("{}: braces are unbalanced".format(name))
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch G: the path-join origin line (guest PC + return address) sits beside patch F's "
+                "warning and before the path is built, all six NSUserDefaults lookups report their key and "
+                "result, both arms of the four whole-file readers are named, the watched-file byte dump is "
+                "inside patch E's read wrapper with read_inner untouched, the origin module is a pure logger "
+                "that does not touch patch F's module, and every patch G call site can only observe, never "
+                "change, the emulated result")
+          CHECK_FSORIGIN
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -3475,7 +4672,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v7
+          name: hyperhle-core-ios-arm64-v8
           path: dist/*
           if-no-files-found: error
           retention-days: 30
