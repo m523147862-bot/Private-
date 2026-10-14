@@ -11,9 +11,10 @@
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v3 variant of build-core.yml (v1). build-core-v2.yml added the
-# logging; v3 keeps it and adds the first patch that fixes a bug instead of
-# instrumenting one:
+# This is the v4 variant of build-core.yml (v1). build-core-v2.yml added the
+# logging; v3 added the first patch that fixes a bug instead of instrumenting
+# one; v4 corrects that patch and adds two fields to the log it was hidden
+# behind:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -24,12 +25,15 @@
 #     the app was looking for. The only lines it touches are log! arguments;
 #   patch C fixes the bundle-resource lookup. On a device the core reported 38
 #     .png files as missing that all really exist in the app bundle root
-#     (nexon-co.png, back.png, ...), because touchHLE only ever tried .lproj
-#     paths and never the un-localized one. Both pathForResource:ofType:inDirectory:
-#     implementations now retry the un-localized path once before returning nil,
-#     which is what Apple's documentation says that method searches anyway.
-# The artifact is named hyperhle-core-ios-arm64-v3 so it cannot be mistaken for
-# the v1 or v2 dylib.
+#     (nexon-co.png, back.png, ...), because touchHLE only ever tried localized
+#     .lproj paths. v3's retry dropped the lproj but still passed the caller's
+#     directory (the log shows it was "English.lproj"), so it recomputed a path
+#     the function had already tried and nothing changed. v4 passes nil for both
+#     lproj and directory, the only combination that reaches the plain
+#     <bundle>/<name> path, and logs the directory and lproj of every failed
+#     lookup so the two components can no longer be confused.
+# The artifact is named hyperhle-core-ios-arm64-v4 so it cannot be mistaken for
+# the v1, v2 or v3 dylib.
 
 name: Build iOS emulator core (dylib)
 
@@ -611,11 +615,29 @@ jobs:
           PATCH_B_PY
           python3 - <<'PATCH_C_PY'
           #!/usr/bin/env python3
-          """Bundle-root resource fallback (patch C) for the Applesauce iOS core.
+          """Bundle-root resource fallback (patch C, v4) for the Applesauce iOS core.
 
-          Counterpart of patch_cf_url.py (patch A) and patch_logging_v2.py (patch B): this
-          one *does* change behaviour, and it is the only one of the three that fixes a
-          bug rather than instrumenting it.
+          Counterpart of patch_cf_url.py (patch A) and patch_logging_v2.py (patch B). Like
+          v3, this one *does* change behaviour - it fixes a bug rather than instrumenting
+          it - but v4 is a correction of the v3 script, not a new fix:
+
+            * v3 retried the un-localized path with
+              `path_for_resource_helper(env, this, name, nil, directory, extension)`,
+              i.e. it dropped only the lproj and kept passing the caller's `directory`.
+              The device log proves the caller passed directory="English.lproj" (every
+              attempt looked like <bundle>/English.lproj/<name>, plus the doubled
+              English.lproj/English.lproj/<name>, and no attempt ever lacked .lproj), and
+              the helper appends lproj *then* directory, so v3 recomputed the exact path
+              the function had already tried first and never reached the bundle root.
+            * v4 passes nil for *both* lproj and directory, so the retry really is
+              <bundle>/<name>. Only dropping both reaches the bundle root; the 38 .png
+              files in the failure are at the bundle root.
+
+            * v4 also adds `directory` and `lproj` to the existing "NSBundle resource
+              lookup: ... missing" log line (patch B's line), because `path` alone could
+              not be split back into the two components the helper builds it from - which
+              is exactly why the v3 mistake above was not visible in the log. No new
+              log! call is added and no logging frequency changes.
 
           What it fixes
           -------------
@@ -628,17 +650,15 @@ jobs:
           does exist in the app bundle *root* (<app>/nexon-co.png, ...), yet the log shows
           only these paths were ever tried:
 
-              <bundle>/English.lproj/<name>
-              <bundle>/English.lproj/English.lproj/<name>   (the lproj was appended twice)
+              <bundle>/English.lproj/<name>                 (lproj=nil, directory="English.lproj")
+              <bundle>/English.lproj/English.lproj/<name>   (lproj="English.lproj", directory="English.lproj")
               <bundle>/en.lproj/English.lproj/<name>
               <bundle>/Base.lproj/English.lproj/<name>
 
-          and never the plain <bundle>/<name>. The game calls the directory-less
-          `pathForResource:ofType:` (the ObjC selector table in the binary has
-          `pathForResource:ofType:`, `URLForResource:withExtension:` and `resourcePath`,
-          and the log prints `(name="nexon-co.png" extension="")`, i.e. directory is nil).
-
-          Apple's documentation for `-pathForResource:ofType:inDirectory:` says: "if a
+          and never the plain <bundle>/<name>. Because the helper appends lproj before
+          directory, that set of paths uniquely means the caller passed
+          directory="English.lproj"; the plain bundle root is only reached when *both* are
+          nil. Apple's documentation for `-pathForResource:ofType:inDirectory:` says: "if a
           resource is not found in the specified directory, this method searches the
           bundle's resource directory and the appropriate language directories". That
           "bundle's resource directory" is the *un-localized* resource directory - the
@@ -647,17 +667,22 @@ jobs:
 
           What it changes
           ---------------
-          In `src/frameworks/foundation/ns_bundle.rs`, in both
-          `pathForResource:ofType:inDirectory:` implementations (the `+` class method and
-          the `-` instance method), after every `.lproj` attempt has failed and just
-          before the function returns nil, it retries the un-localized (bundle-root) path
-          by calling `path_for_resource_helper(env, this, name, nil, directory,
-          extension)` - the same helper, with `lproj` passed as nil. That form is already
-          used at the top of both functions for the caller-supplied `directory`, so no new
-          API surface is introduced.
+          In `src/frameworks/foundation/ns_bundle.rs`:
 
-          Every other resource entry point reaches this fallback through delegation and is
-          therefore covered without its own edit:
+            C1  both `pathForResource:ofType:inDirectory:` implementations (the `+` class
+                method and the `-` instance method): after every `.lproj` attempt has
+                failed and just before the function returns nil, retry the un-localized
+                (bundle-root) path with
+                `path_for_resource_helper(env, this, name, nil, nil, extension)` - the
+                same helper with both `lproj` and `directory` passed as nil.
+
+            C2  `path_for_resource_helper` itself: convert `directory` and `lproj` with
+                `ns_string::to_rust_string` (which returns "" for nil) and add them to the
+                existing "NSBundle resource lookup: ... missing" log line. This is the
+                same log line patch B rewrote, so C2 must run *after* patch B.
+
+          Every other resource entry point reaches the C1 fallback through delegation and
+          is therefore covered without its own edit:
             * pathForResource:ofType:                       -> pathForResource:ofType:inDirectory:
             * pathForResource:ofType:inDirectory:forLocalization: -> pathForResource:ofType:inDirectory:
             * URLForResource:withExtension:                 -> URLForResource:withExtension:subdirectory:
@@ -668,10 +693,12 @@ jobs:
           friends) are deliberately NOT touched: they enumerate a directory, and adding a
           bundle-root retry there would change the meaning of the enumerations.
 
-          Usage: python3 patch_ns_bundle_root_fallback.py [repo-root]   (default: .)
+          Usage: python3 patch_ns_bundle_root_fallback_v4.py [repo-root]   (default: .)
+          Must be run after patch_logging_v2.py (patch B): the C2 anchor is the text B
+          leaves behind.
 
-          The script applies the edit by exact text replacement, refuses to run unless the
-          anchor matches the expected number of times, skips the edit if it is already
+          The script applies the edits by exact text replacement, refuses to run unless an
+          anchor matches the expected number of times, skips edits that are already
           applied (running it twice is safe) and re-checks every marker and the brace
           balance afterwards.
           """
@@ -683,11 +710,11 @@ jobs:
 
           # An edit is (name, target file, anchor text, replacement, occurrences of the
           # anchor that must be found, marker that proves the replacement landed).
-          #
-          # The anchor is the tail of `pathForResource:ofType:inDirectory:` - the Base.lproj
-          # attempt plus the final `nil` - which is byte-identical in the class (`+`) and
-          # the instance (`-`) implementation, hence two occurrences and two insertions.
           EDITS = [
+              # C1: the anchor is the tail of `pathForResource:ofType:inDirectory:` - the
+              # Base.lproj attempt plus the final `nil` - which is byte-identical in the
+              # class (`+`) and the instance (`-`) implementation, hence two occurrences
+              # and two insertions. (v4: same anchor as v3, corrected replacement.)
               (
                   "C1 ns_bundle retries the un-localized (bundle-root) path",
                   NS_BUNDLE,
@@ -712,16 +739,25 @@ jobs:
                       return path;
                   }
               }
-              // Resource-lookup fix (patch C): every attempt above produced a localized
-              // (.lproj) path. Apple's documentation for -pathForResource:ofType:inDirectory:
-              // says "if a resource is not found in the specified directory, this method
-              // searches the bundle's resource directory and the appropriate language
-              // directories", i.e. the un-localized bundle resource directory - the bundle
-              // root when directory is nil - is searched as well. touchHLE never did, so a
+              // Resource-lookup fix (patch C, corrected in v4): every attempt above
+              // produced a localized (.lproj) path, but the attempt at the top of this
+              // function only differed from them by not adding an lproj of its own - the
+              // caller-supplied `directory` was appended to it either way. On the device
+              // the caller passed directory="English.lproj": the log shows
+              // English.lproj/English.lproj/<name> and never a path without .lproj, so
+              // the v3 retry, which kept `directory`, recomputed exactly that first path
+              // and changed nothing. Apple's documentation for
+              // -pathForResource:ofType:inDirectory: says "if a resource is not found in
+              // the specified directory, this method searches the bundle's resource
+              // directory and the appropriate language directories", i.e. the
+              // un-localized bundle resource directory - the bundle root when both lproj
+              // and directory are nil - is searched as well. touchHLE never did, so a
               // resource that really exists at the bundle root (nexon-co.png, back.png,
               // bar.png, UI_Menu_Arrow_Right.png, moregames_1.png, ...) was reported
-              // missing. Retry once with no lproj, i.e. the un-localized path.
-              let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);
+              // missing. Retry once with *both* lproj and directory nil, which alone
+              // yields the plain <bundle>/<name> path; dropping lproj while still
+              // passing `directory` does not reach the bundle root.
+              let bundle_root_path = path_for_resource_helper(env, this, name, nil, nil, extension);
               if bundle_root_path != nil {
                   return bundle_root_path;
               }
@@ -729,7 +765,64 @@ jobs:
           }
           ''',
                   2,
-                  "    let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);",
+                  "    let bundle_root_path = path_for_resource_helper(env, this, name, nil, nil, extension);",
+              ),
+              # C2: patch B's instrumentation block. v4 replaces the "directory is
+              # deliberately not logged" paragraph (that reason is what hid the v3 bug)
+              # and adds the two fields. The anchor is byte-identical to what patch B
+              # writes, so this edit only applies after patch B.
+              (
+                  "C2 ns_bundle logs the lookup's directory and lproj",
+                  NS_BUNDLE,
+                  r'''    // `directory` is deliberately not converted or logged here.
+              // `to_rust_string` panics unless its argument is nil or a StringHostObject,
+              // and this function never passes `directory` to it (the checks above
+              // convert `name` and `extension`, not `directory`), so its host object
+              // type is unproven and a panic in a log statement would take the whole
+              // emulator down. It would also be redundant: `path` already has
+              // `directory` appended to it a few lines above.
+              let path_debug = ns_string::to_rust_string(env, path);
+              let data_path_debug = ns_string::to_rust_string(env, data_path);
+              let name_debug = ns_string::to_rust_string(env, name);
+              let extension_debug = ns_string::to_rust_string(env, extension);
+              log!(
+                  "NSBundle resource lookup: {:?} missing, Unity Data fallback {:?} exists={} \
+                   (name={:?} extension={:?})",
+                  path_debug,
+                  data_path_debug,
+                  data_path_exists,
+                  name_debug,
+                  extension_debug
+              );
+          ''',
+                  r'''    // `directory` and `lproj` are the other two components of the path built
+              // above, so log them as well: `path` alone cannot be split back into them,
+              // and not being able to tell them apart is exactly what hid the v3 bug.
+              // `to_rust_string` returns "" for nil, and `lproj` is always one of the
+              // static .lproj strings created a few lines above (or nil). `directory` is
+              // whatever the caller passed through `pathForResource:ofType:inDirectory:`;
+              // the paths this app exercises pass an NSString, and the same conversion is
+              // already applied to the `name` and `extension` the caller passed.
+              let path_debug = ns_string::to_rust_string(env, path);
+              let data_path_debug = ns_string::to_rust_string(env, data_path);
+              let name_debug = ns_string::to_rust_string(env, name);
+              let extension_debug = ns_string::to_rust_string(env, extension);
+              let directory_debug = ns_string::to_rust_string(env, directory);
+              let lproj_debug = ns_string::to_rust_string(env, lproj);
+              log!(
+                  "NSBundle resource lookup: {:?} missing, Unity Data fallback {:?} exists={} \
+                   (name={:?} extension={:?} directory={:?} lproj={:?})",
+                  path_debug,
+                  data_path_debug,
+                  data_path_exists,
+                  name_debug,
+                  extension_debug,
+                  directory_debug,
+                  lproj_debug
+              );
+          ''',
+                  1,
+                  "let directory_debug = ns_string::to_rust_string(env, directory);",
               ),
           ]
 
@@ -795,9 +888,10 @@ jobs:
         run: |
           set -eu
           # Self-check for the CoreFoundation patch (A), the logging patches (B) and the
-          # bundle-root resource fallback (C). Run from the root of the checkout. Fails the
-          # build if any of them did not land, so a run can never upload a dylib that still
-          # logs the old way or that is still missing the resource-lookup fix.
+          # bundle-root resource fallback (C, v4). Run from the root of the checkout. Fails
+          # the build if any of them did not land, so a run can never upload a dylib that
+          # still logs the old way, still hides the lookup's directory/lproj, or is still
+          # missing the resource-lookup fix.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -810,10 +904,9 @@ jobs:
 
           # Every marker below is a string whose occurrence count in the patched file the
           # corresponding patch script fixes: the ones an edit inserts must appear the
-          # stated number of times, and `directory_debug` must appear none (patch B used
-          # to log `directory` too, but `to_rust_string` panics on anything that is not
-          # nil or a StringHostObject and ns_bundle.rs never proved `directory` is one,
-          # while `path` already contains it).
+          # stated number of times, and any marker with expected 0 asserts that a form the
+          # patch is supposed to have replaced is really gone. The counts are compared, so
+          # a marker that appears even once too often fails the build.
           check_marker() {
             target=$1
             marker=$2
@@ -830,13 +923,26 @@ jobs:
           check_marker "$bundle" "let path_debug = ns_string::to_rust_string(env, path);" 1
           check_marker "$bundle" "let data_path_debug = ns_string::to_rust_string(env, data_path);" 1
           check_marker "$bundle" "let name_debug = ns_string::to_rust_string(env, name);" 1
-          check_marker "$bundle" "directory_debug" 0
           check_marker "$bundle" "let extension_debug = ns_string::to_rust_string(env, extension);" 1
-          check_marker "$bundle" "(name={:?} extension={:?})" 1
+          # Patch C v4 (C2): the missing-resource log names the lookup's directory and
+          # lproj, and both are converted with the nil-safe helper.
+          check_marker "$bundle" "let directory_debug = ns_string::to_rust_string(env, directory);" 1
+          check_marker "$bundle" "let lproj_debug = ns_string::to_rust_string(env, lproj);" 1
+          check_marker "$bundle" "(name={:?} extension={:?} directory={:?} lproj={:?})" 1
 
-          # Patch C: one bundle-root retry in each pathForResource:ofType:inDirectory:
-          # implementation (the + class method and the - instance method), so exactly two.
-          check_marker "$bundle" "let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);" 2
+          # Patch C v4 (C1): one bundle-root retry in each pathForResource:ofType:inDirectory:
+          # implementation (the + class method and the - instance method), so exactly two,
+          # and both must pass nil for *both* lproj and directory - only that reaches the
+          # bundle root. The positive marker carries the `let bundle_root_path =` prefix.
+          check_marker "$bundle" "let bundle_root_path = path_for_resource_helper(env, this, name, nil, nil, extension);" 2
+          # Negative assertion: the v3 form of the same retry dropped only lproj and kept
+          # passing the caller's `directory`, which recomputed the path the function had
+          # already tried and therefore never reached the bundle root. It must be gone.
+          # The `let bundle_root_path =` prefix keeps this marker on the fallback call
+          # alone: the two pre-existing calls at the top of both implementations are
+          # `let path = path_for_resource_helper(env, this, name, nil, directory,
+          # extension);` and do not match it.
+          check_marker "$bundle" "let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);" 0
 
           posix=src/libc/posix_io.rs
           check_marker "$posix" "let read_fd_path: Option<String> = file.path.clone();" 1
@@ -992,7 +1098,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v3
+          name: hyperhle-core-ios-arm64-v4
           path: dist/*
           if-no-files-found: error
           retention-days: 30
