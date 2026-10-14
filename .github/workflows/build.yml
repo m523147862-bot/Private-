@@ -7,12 +7,13 @@
 # Artifacts section at the bottom of the run page.
 #
 # Nothing needs to be forked. The job checks out the upstream Applesauce
-# repository at a fixed commit on the runner itself, applies two patches, builds
-# the core, verifies the result and uploads it. This file is the only file the
-# account running it needs.
+# repository at a fixed commit on the runner itself, applies three patches,
+# builds the core, verifies the result and uploads it. This file is the only
+# file the account running it needs.
 #
-# This is the logging variant of build-core.yml (v1), and the two patches are
-# independent:
+# This is the v3 variant of build-core.yml (v1). build-core-v2.yml added the
+# logging; v3 keeps it and adds the first patch that fixes a bug instead of
+# instrumenting one:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -20,9 +21,15 @@
 #     and no control flow: it makes the warnings about a missing bundle resource
 #     and about reading/seeking a directory print the real guest paths instead
 #     of ObjC pointers, so "Fail to Create data" can be traced to the exact file
-#     the app was looking for. The only lines it touches are log! arguments.
-# The artifact is named hyperhle-core-ios-arm64-logging so it cannot be mistaken
-# for the v1 dylib.
+#     the app was looking for. The only lines it touches are log! arguments;
+#   patch C fixes the bundle-resource lookup. On a device the core reported 38
+#     .png files as missing that all really exist in the app bundle root
+#     (nexon-co.png, back.png, ...), because touchHLE only ever tried .lproj
+#     paths and never the un-localized one. Both pathForResource:ofType:inDirectory:
+#     implementations now retry the un-localized path once before returning nil,
+#     which is what Apple's documentation says that method searches anyway.
+# The artifact is named hyperhle-core-ios-arm64-v3 so it cannot be mistaken for
+# the v1 or v2 dylib.
 
 name: Build iOS emulator core (dylib)
 
@@ -602,13 +609,195 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_B_PY
+          python3 - <<'PATCH_C_PY'
+          #!/usr/bin/env python3
+          """Bundle-root resource fallback (patch C) for the Applesauce iOS core.
+
+          Counterpart of patch_cf_url.py (patch A) and patch_logging_v2.py (patch B): this
+          one *does* change behaviour, and it is the only one of the three that fixes a
+          bug rather than instrumenting it.
+
+          What it fixes
+          -------------
+          On a real device the core logged
+
+              NSBundle resource lookup: "..." missing
+
+          164 times for 38 distinct .png files (nexon-co.png, back.png, bar.png,
+          UI_Menu_Arrow_Right.png, moregames_1.png, ...). Every one of those files really
+          does exist in the app bundle *root* (<app>/nexon-co.png, ...), yet the log shows
+          only these paths were ever tried:
+
+              <bundle>/English.lproj/<name>
+              <bundle>/English.lproj/English.lproj/<name>   (the lproj was appended twice)
+              <bundle>/en.lproj/English.lproj/<name>
+              <bundle>/Base.lproj/English.lproj/<name>
+
+          and never the plain <bundle>/<name>. The game calls the directory-less
+          `pathForResource:ofType:` (the ObjC selector table in the binary has
+          `pathForResource:ofType:`, `URLForResource:withExtension:` and `resourcePath`,
+          and the log prints `(name="nexon-co.png" extension="")`, i.e. directory is nil).
+
+          Apple's documentation for `-pathForResource:ofType:inDirectory:` says: "if a
+          resource is not found in the specified directory, this method searches the
+          bundle's resource directory and the appropriate language directories". That
+          "bundle's resource directory" is the *un-localized* resource directory - the
+          bundle root when no directory is given. touchHLE only ever tried the localized
+          directories, so a resource that lives at the bundle root is reported missing.
+
+          What it changes
+          ---------------
+          In `src/frameworks/foundation/ns_bundle.rs`, in both
+          `pathForResource:ofType:inDirectory:` implementations (the `+` class method and
+          the `-` instance method), after every `.lproj` attempt has failed and just
+          before the function returns nil, it retries the un-localized (bundle-root) path
+          by calling `path_for_resource_helper(env, this, name, nil, directory,
+          extension)` - the same helper, with `lproj` passed as nil. That form is already
+          used at the top of both functions for the caller-supplied `directory`, so no new
+          API surface is introduced.
+
+          Every other resource entry point reaches this fallback through delegation and is
+          therefore covered without its own edit:
+            * pathForResource:ofType:                       -> pathForResource:ofType:inDirectory:
+            * pathForResource:ofType:inDirectory:forLocalization: -> pathForResource:ofType:inDirectory:
+            * URLForResource:withExtension:                 -> URLForResource:withExtension:subdirectory:
+            * URLForResource:withExtension:subdirectory:    -> pathForResource:ofType:inDirectory:
+            * URLForResource:withExtension:subdirectory:localization: -> pathForResource:ofType:inDirectory:
+
+          The resource *enumeration* methods (`pathsForResourcesOfType:inDirectory:` and
+          friends) are deliberately NOT touched: they enumerate a directory, and adding a
+          bundle-root retry there would change the meaning of the enumerations.
+
+          Usage: python3 patch_ns_bundle_root_fallback.py [repo-root]   (default: .)
+
+          The script applies the edit by exact text replacement, refuses to run unless the
+          anchor matches the expected number of times, skips the edit if it is already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          NS_BUNDLE = "src/frameworks/foundation/ns_bundle.rs"
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, marker that proves the replacement landed).
+          #
+          # The anchor is the tail of `pathForResource:ofType:inDirectory:` - the Base.lproj
+          # attempt plus the final `nil` - which is byte-identical in the class (`+`) and
+          # the instance (`-`) implementation, hence two occurrences and two insertions.
+          EDITS = [
+              (
+                  "C1 ns_bundle retries the un-localized (bundle-root) path",
+                  NS_BUNDLE,
+                  r'''    // Base.lproj is Apple's Base internationalization fallback used by
+              // storyboards and other resources that don't have a per-language copy.
+              {
+                  let lproj_ns: id = ns_string::get_static_str(env, "Base.lproj");
+                  let path = path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
+                  if path != nil {
+                      return path;
+                  }
+              }
+              nil
+          }
+          ''',
+                  r'''    // Base.lproj is Apple's Base internationalization fallback used by
+              // storyboards and other resources that don't have a per-language copy.
+              {
+                  let lproj_ns: id = ns_string::get_static_str(env, "Base.lproj");
+                  let path = path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
+                  if path != nil {
+                      return path;
+                  }
+              }
+              // Resource-lookup fix (patch C): every attempt above produced a localized
+              // (.lproj) path. Apple's documentation for -pathForResource:ofType:inDirectory:
+              // says "if a resource is not found in the specified directory, this method
+              // searches the bundle's resource directory and the appropriate language
+              // directories", i.e. the un-localized bundle resource directory - the bundle
+              // root when directory is nil - is searched as well. touchHLE never did, so a
+              // resource that really exists at the bundle root (nexon-co.png, back.png,
+              // bar.png, UI_Menu_Arrow_Right.png, moregames_1.png, ...) was reported
+              // missing. Retry once with no lproj, i.e. the un-localized path.
+              let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);
+              if bundle_root_path != nil {
+                  return bundle_root_path;
+              }
+              nil
+          }
+          ''',
+                  2,
+                  "    let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);",
+              ),
+          ]
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              texts = {}
+              for target in sorted({edit[1] for edit in EDITS}):
+                  path = repo / target
+                  if not path.is_file():
+                      fail("{} does not exist".format(path))
+                  texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+              for name, target, old, new, occurrences, marker in EDITS:
+                  text = texts[target]
+                  if marker in text:
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  if replaced.count(marker) != occurrences:
+                      fail("{}: \"{}\" landed {} time(s), expected {}".format(
+                          target, name, replaced.count(marker), occurrences))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              for name, target, _old, _new, occurrences, marker in EDITS:
+                  if texts[target].count(marker) != occurrences:
+                      fail("{}: post-condition failed for \"{}\": {} occurrence(s) of the marker, expected {}".format(
+                          target, name, texts[target].count(marker), occurrences))
+
+              for target, text in texts.items():
+                  if text.count("{") != text.count("}"):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_C_PY
 
       - name: Check that the patches really landed
         run: |
           set -eu
-          # Self-check for the CoreFoundation patch (A) and the logging patches (B).
-          # Run from the root of the checkout. Fails the build if any of them did not
-          # land, so a run can never upload a dylib that still logs the old way.
+          # Self-check for the CoreFoundation patch (A), the logging patches (B) and the
+          # bundle-root resource fallback (C). Run from the root of the checkout. Fails the
+          # build if any of them did not land, so a run can never upload a dylib that still
+          # logs the old way or that is still missing the resource-lookup fix.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -619,8 +808,8 @@ jobs:
             exit 1
           fi
 
-          # Every marker below is a string whose occurrence count in the patched file
-          # patch_logging_v2.py fixes: the ones a patch edit inserts must appear the
+          # Every marker below is a string whose occurrence count in the patched file the
+          # corresponding patch script fixes: the ones an edit inserts must appear the
           # stated number of times, and `directory_debug` must appear none (patch B used
           # to log `directory` too, but `to_rust_string` panics on anything that is not
           # nil or a StringHostObject and ns_bundle.rs never proved `directory` is one,
@@ -644,6 +833,10 @@ jobs:
           check_marker "$bundle" "directory_debug" 0
           check_marker "$bundle" "let extension_debug = ns_string::to_rust_string(env, extension);" 1
           check_marker "$bundle" "(name={:?} extension={:?})" 1
+
+          # Patch C: one bundle-root retry in each pathForResource:ofType:inDirectory:
+          # implementation (the + class method and the - instance method), so exactly two.
+          check_marker "$bundle" "let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);" 2
 
           posix=src/libc/posix_io.rs
           check_marker "$posix" "let read_fd_path: Option<String> = file.path.clone();" 1
@@ -799,7 +992,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-logging
+          name: hyperhle-core-ios-arm64-v3
           path: dist/*
           if-no-files-found: error
           retention-days: 30
