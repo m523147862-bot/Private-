@@ -203,8 +203,8 @@
 #     language or `NSBundle` logic (the app hard-codes the "English"
 #     localization, which is unrelated to this bug). v12 is based on v10 rather
 #     than v11 so that the device log stays as clean as the v10 one.
-# The artifact is named hyperhle-core-ios-arm64-v12 so it cannot be mistaken for
-# the v1..v11 dylibs.
+# The artifact is named hyperhle-core-ios-arm64-v15 so it cannot be mistaken for
+# the v1..v14 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -293,7 +293,8 @@ jobs:
              the bundle-root fallback, the EUC-KR decoding, the file/texture tracing,
              the filesystem probe/write tracing, the path-origin tracing, the
              nil-component stack trace, the __vsprintf_chk signature fix and the
-             guest-filesystem resource read
+             guest-filesystem resource read, the shared touch/render geometry,
+             the CJK/Arabic text fallback and the glyph-id .notdef trace
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -4998,16 +4999,1620 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_K_PY
+          python3 - <<'PATCH_V13_TOUCH_MAPPING_PY'
+          #!/usr/bin/env python3
+          """Make the touch path and the render path share one geometry.
+          
+          Background (DNF: Swordman, com.nexonmobile.dnfswordman, iPhone 14 Pro Max):
+          
+          The core presents the guest framebuffer into a *letterboxed* rectangle of the
+          SDL drawable and maps host touches back through the same rectangle. Both ends
+          already call `Window::viewport()`, so the rect itself is shared, but three
+          things around it were still computed twice, or in the wrong units:
+          
+          1. The guest screen size the touches are reported in came from
+             `Window::size_unrotated_unscaled()`, i.e. `screen_size()` (which honours
+             `--screen-size=`), while the compositor draws the app into the size
+             `-[UIScreen bounds]` reports (`device_family().portrait_size()`, swapped for
+             a landscape rotation when `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` is set). Two
+             sources that agree today only because `--screen-size=` happens to be unset.
+             As soon as they disagree, every touch is scaled into the wrong guest screen.
+          
+          2. SDL reports *mouse* positions in window coordinates (points) while
+             `viewport()` and SDL's normalised finger positions are both in drawable
+             pixels. On this host that is 932x430 points over a 2796x1290 drawable, so a
+             mouse (or an iOS 13.4+ indirect pointer, which SDL delivers as mouse events)
+             landed at one third of its intended position.
+          
+          3. `glViewport()` measures y from the bottom of the drawable, SDL events from
+             the top. The fit centres the content, so the two coincide today, but the
+             input path silently depended on that.
+          
+          It also converges the *render* side onto the same guest size. `Window::viewport`
+          used to build the letterbox from `screen_size()` (which honours `--screen-size=`)
+          scaled by `--scale-hack=`, i.e. from neither of the two things the guest is
+          actually told about. `--scale-hack=` is a render-resolution multiplier and must
+          not move the letterbox at all; `--screen-size=` changes the host window, not
+          `-[UIScreen bounds]`, so it must not stretch the picture or the touch mapping
+          either. Both are fixed here, which makes the touch mapping independent of both
+          options.
+          
+          This patch moves the conversions into `src/window/geometry.rs` and gives the
+          renderer and the input path one function each to call.
+          
+          Finally it adds an opt-in trace that prints the numbers for each touch, so a
+          remaining misalignment can be attributed from data. An iOS user cannot set
+          environment variables, so the trace is reachable through the ordinary option
+          mechanism as `--trace-touch-map` (the per-app line in
+          `Documents/touchHLE_options.txt`, like `--print-fps`) as well as through
+          `TOUCHHLE_TRACE_TOUCH_MAP=1` in the environment; either turns it on. It logs the
+          first 40 events in full and then one line per 100.
+          
+          It is deliberately conservative: for the pinned tree's own configuration
+          (iPhone3GS, 480x320 landscape, `--scale-hack=3`, no `--screen-size=`) the
+          resulting touch coordinates are bit-for-bit what they were before, which the
+          unit tests in `src/window/geometry.rs` pin down by checking that mapping a
+          point from the host into guest space is the exact inverse of the mapping the
+          presenter uses to draw guest space onto the host.
+          
+          Usage: python3 patch_touch_mapping_v13.py [repo-root]   (default: current dir)
+          
+          Idempotent: running it twice changes nothing and still exits 0.
+          """
+          
+          import re
+          import sys
+          from pathlib import Path
+          
+          MARKER = "PATCH_V13_TOUCH_MAPPING"
+          
+          WINDOW_RS = "src/window.rs"
+          GEOMETRY_RS = "src/window/geometry.rs"
+          
+          GEOMETRY_SRC = '''/*
+           * This Source Code Form is subject to the terms of the Mozilla Public
+           * License, v. 2.0. If a copy of the MPL was not distributed with this
+           * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+           */
+          //! Coordinate conversions shared by window presentation and input.
+          //!
+          //! The presenter (`gles::present` via `frameworks::opengles::eagl` and
+          //! `frameworks::core_animation::composition`) and the input path
+          //! (`Window::poll_for_events`) must agree about two things: the rectangle of
+          //! the host drawable the guest screen is shown in, and the size of the guest
+          //! screen itself. Both conversions live here so neither side can quietly grow
+          //! its own copy, and the tests at the bottom of this file pin down the one
+          //! property that keeps taps on target: converting a host point into guest
+          //! space is the exact inverse of the conversion the presenter uses to draw
+          //! guest space onto the host.
+          //!
+          //! [PATCH_V13_TOUCH_MAPPING]
+          
+          /// Fit a guest rectangle into a host drawable, preserving its aspect ratio and
+          /// centring it. Everything outside the returned rectangle is the letterbox /
+          /// pillarbox bar the presenter clears to black.
+          ///
+          /// The scale is whatever the two aspect ratios imply, so it is *not*
+          /// necessarily an integer, and the rectangle is not necessarily flush with any
+          /// edge of the drawable: callers must use this rectangle rather than assuming
+          /// an integer scale or that the content fills the drawable.
+          pub(super) fn fit_viewport(
+              (app_width, app_height): (u32, u32),
+              (screen_width, screen_height): (u32, u32),
+          ) -> (u32, u32, u32, u32) {
+              if app_width == 0 || app_height == 0 || screen_width == 0 || screen_height == 0 {
+                  return (0, 0, 0, 0);
+              }
+              let app_aspect = app_width as f32 / app_height as f32;
+              let screen_aspect = screen_width as f32 / screen_height as f32;
+              let (scaled_width, scaled_height) = if app_aspect < screen_aspect {
+                  (
+                      (screen_height as f32 * app_aspect).round() as u32,
+                      screen_height,
+                  )
+              } else {
+                  (
+                      screen_width,
+                      (screen_width as f32 / app_aspect).round() as u32,
+                  )
+              };
+              let x = (screen_width - scaled_width) / 2;
+              let y = (screen_height - scaled_height) / 2;
+              (x, y, scaled_width, scaled_height)
+          }
+          
+          /// Convert SDL window coordinates to drawable pixels.
+          ///
+          /// SDL reports mouse positions in window coordinates (points, the same space
+          /// as `SDL_GetWindowSize`), while touch positions are normalised to the
+          /// drawable and `Window::viewport` is in drawable pixels (`SDL_GL_GetDrawable
+          /// Size`). On a high-DPI host the two differ by the display scale — 3x on a
+          /// Retina iPhone — so mouse input has to be converted before it is mapped
+          /// through the viewport.
+          pub(super) fn window_to_drawable(
+              (x, y): (f32, f32),
+              (window_width, window_height): (u32, u32),
+              (drawable_width, drawable_height): (u32, u32),
+          ) -> (f32, f32) {
+              if window_width == 0 || window_height == 0 {
+                  return (0.0, 0.0);
+              }
+              (
+                  x * drawable_width as f32 / window_width as f32,
+                  y * drawable_height as f32 / window_height as f32,
+              )
+          }
+          
+          /// Re-express a `glViewport()`-style rectangle as one with SDL's y.
+          ///
+          /// `glViewport()` measures y from the bottom edge of the drawable, SDL input
+          /// events from the top. The presenter centres the content vertically, so for
+          /// every window the emulator actually creates today the two are the same
+          /// number; going through this function anyway stops the input path from
+          /// depending on that.
+          pub(super) fn gl_to_top_down_viewport(
+              (x, y, width, height): (u32, u32, u32, u32),
+              drawable_height: u32,
+          ) -> (u32, u32, u32, u32) {
+              let top_down_y = drawable_height.saturating_sub(y.saturating_add(height));
+              (x, top_down_y, width, height)
+          }
+          
+          /// Map a point to a unit square centred on the viewport, so that -0.5 is the
+          /// viewport's low edge and +0.5 its high edge.
+          ///
+          /// Points outside the viewport are in a letterbox bar; they are clamped to the
+          /// nearest visible edge so they still hit the guest screen instead of being
+          /// rejected by hit-testing (see the call site for the long version of that
+          /// story). An empty viewport maps to the centre rather than dividing by zero.
+          pub(super) fn normalize_viewport_coords(
+              (x, y): (f32, f32),
+              (vx, vy, vw, vh): (u32, u32, u32, u32),
+          ) -> (f32, f32) {
+              if vw == 0 || vh == 0 {
+                  return (0.0, 0.0);
+              }
+              (
+                  ((x - vx as f32) / vw as f32).clamp(0.0, 1.0) - 0.5,
+                  ((y - vy as f32) / vh as f32).clamp(0.0, 1.0) - 0.5,
+              )
+          }
+          
+          /// How many touch events the `--trace-touch-map` diagnostic logs in full
+          /// before switching to a summary line every [TOUCH_TRACE_EVERY] events.
+          pub(super) const TOUCH_TRACE_FIRST: u64 = 40;
+          pub(super) const TOUCH_TRACE_EVERY: u64 = 100;
+          
+          /// Whether the `n`-th (0-based) touch event should be logged: the first
+          /// [TOUCH_TRACE_FIRST] in full, then one in every [TOUCH_TRACE_EVERY], so that
+          /// leaving the diagnostic on for a long play session cannot flood the log.
+          pub(super) fn should_log_touch_trace(n: u64) -> bool {
+              n < TOUCH_TRACE_FIRST || n % TOUCH_TRACE_EVERY == 0
+          }
+          
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+          
+              /// The emulated device in the DNF report: an iPhone3GS (320x480) running a
+              /// landscape app, on an iPhone 14 Pro Max (932x430 points, 2796x1290
+              /// drawable) with `--scale-hack=3`.
+              const DRAWABLE: (u32, u32) = (2796, 1290);
+              const SCALE_HACK: u32 = 3;
+              const GUEST: (u32, u32) = (320, 480);
+          
+              fn landscape_viewport() -> (u32, u32, u32, u32) {
+                  fit_viewport(
+                      (480 * SCALE_HACK, 320 * SCALE_HACK),
+                      DRAWABLE,
+                  )
+              }
+          
+              #[test]
+              fn fit_viewport_matches_the_measured_dnf_geometry() {
+                  // Measured on the device screenshot: content 1935x1290 px centred in
+                  // the 2796x1290 drawable, i.e. 430 px of black on each side. The scale
+                  // is 1935/1440 = 1.34375, deliberately *not* an integer.
+                  assert_eq!(landscape_viewport(), (430, 0, 1935, 1290));
+              }
+          
+              #[test]
+              fn fit_viewport_is_centred_and_never_upscales_past_the_drawable() {
+                  // A drawable that is wider than the guest aspect: pillarbox.
+                  assert_eq!(fit_viewport((480, 320), (2796, 1290)), (430, 0, 1935, 1290));
+                  // A drawable that is narrower: letterbox (the 437 px difference is
+                  // split 218/219 by integer division, as the presenter's own maths does).
+                  assert_eq!(fit_viewport((480, 320), (1280, 1290)), (0, 218, 1280, 853));
+                  // Exactly matching: fill it.
+                  assert_eq!(fit_viewport((480, 320), (960, 640)), (0, 0, 960, 640));
+                  // Degenerate inputs must not panic or divide by zero.
+                  assert_eq!(fit_viewport((0, 0), (100, 100)), (0, 0, 0, 0));
+                  assert_eq!(fit_viewport((480, 320), (0, 0)), (0, 0, 0, 0));
+              }
+          
+              #[test]
+              fn mouse_positions_are_converted_to_drawable_pixels() {
+                  // 932x430 points over a 2796x1290 drawable is the reported host.
+                  let window = (932, 430);
+                  assert_eq!(
+                      window_to_drawable((100.0, 100.0), window, DRAWABLE),
+                      (300.0, 300.0)
+                  );
+                  // A mouse and a touch at the same physical place must agree: SDL
+                  // normalises touches, so the equivalent normalised position times the
+                  // drawable size has to come out the same.
+                  let mouse = window_to_drawable((466.0, 215.0), window, DRAWABLE);
+                  let finger = (0.5 * DRAWABLE.0 as f32, 0.5 * DRAWABLE.1 as f32);
+                  assert!((mouse.0 - finger.0).abs() < 0.001);
+                  assert!((mouse.1 - finger.1).abs() < 0.001);
+                  // On a host where points and pixels are the same, nothing changes.
+                  assert_eq!(
+                      window_to_drawable((123.0, 45.0), (480, 320), (480, 320)),
+                      (123.0, 45.0)
+                  );
+                  assert_eq!(window_to_drawable((1.0, 1.0), (0, 0), DRAWABLE), (0.0, 0.0));
+              }
+          
+              #[test]
+              fn gl_viewport_is_flipped_to_sdl_top_down() {
+                  // A vertically centred rect is its own flip: which is why the input
+                  // path could get away without this conversion.
+                  assert_eq!(gl_to_top_down_viewport((0, 0, 960, 640), 640), (0, 0, 960, 640));
+                  assert_eq!(
+                      gl_to_top_down_viewport((430, 0, 1935, 1290), 1290),
+                      (430, 0, 1935, 1290)
+                  );
+                  // An asymmetric one is not.
+                  assert_eq!(
+                      gl_to_top_down_viewport((0, 320, 960, 640), 1280),
+                      (0, 320, 960, 640)
+                  );
+                  // A bottom-aligned rect does move.
+                  assert_eq!(gl_to_top_down_viewport((0, 0, 960, 300), 1280), (0, 980, 960, 300));
+              }
+          
+              #[test]
+              fn points_in_the_bars_clamp_to_the_nearest_edge() {
+                  let viewport = landscape_viewport();
+                  // Centre of the content: x = 430 + 1935/2, y = 0 + 1290/2.
+                  assert_eq!(
+                      normalize_viewport_coords((1397.5, 645.0), viewport),
+                      (0.0, 0.0)
+                  );
+                  // Inside the left bar clamps to its right edge, i.e. the content's
+                  // left edge, and a point well past the right edge to the other one.
+                  assert_eq!(
+                      normalize_viewport_coords((0.0, 645.0), viewport),
+                      (-0.5, 0.0)
+                  );
+                  assert_eq!(
+                      normalize_viewport_coords((2796.0, 645.0), viewport),
+                      (0.5, 0.0)
+                  );
+                  // Empty viewport: finite, not NaN.
+                  assert_eq!(normalize_viewport_coords((5.0, 5.0), (0, 0, 0, 0)), (0.0, 0.0));
+              }
+          
+              /// The presenter's mapping, transcribed from
+              /// `gles::present::present_frame` for a -90 degree device rotation
+              /// (`window::DeviceOrientation::LandscapeLeft`):
+              ///
+              /// `present_frame` draws a full-viewport quad whose texture coordinates it
+              /// rotates about (0.5, 0.5) with `Window::rotation_matrix()`. For
+              /// LandscapeLeft that puts the guest screen's top-left corner at the
+              /// viewport's top-right, sends the guest x axis down the screen and its y
+              /// axis to the left. In terms of the guest's unit square, u = gx / W and
+              /// v = 1 - gy / H (v points up, GL style):
+              ///
+              ///     sx = vx + (1 - gy / H) * vw
+              ///     sy = vy + (gx / W) * vh
+              ///
+              /// Returns a point in the same top-down space SDL delivers input in.
+              fn presenter_guest_to_screen(
+                  (vx, vy, vw, vh): (u32, u32, u32, u32),
+                  guest: (u32, u32),
+                  (gx, gy): (f32, f32),
+              ) -> (f32, f32) {
+                  let (w, h) = (guest.0 as f32, guest.1 as f32);
+                  (
+                      vx as f32 + (1.0 - gy / h) * vw as f32,
+                      vy as f32 + (gx / w) * vh as f32,
+                  )
+              }
+          
+              /// The input path, transcribed from `Window::poll_for_events`:
+              /// normalise inside the viewport, rotate with the inverse of the
+              /// presenter's matrix (`z_rotation(+90 degrees)` for LandscapeLeft, i.e.
+              /// (x, y) -> (y, -x)), then scale into the guest screen.
+              fn input_screen_to_guest(
+                  viewport: (u32, u32, u32, u32),
+                  guest: (u32, u32),
+                  screen: (f32, f32),
+              ) -> (f32, f32) {
+                  let (x, y) = normalize_viewport_coords(screen, viewport);
+                  let (x, y) = (y, -x);
+                  (
+                      (x + 0.5) * guest.0 as f32,
+                      (y + 0.5) * guest.1 as f32,
+                  )
+              }
+          
+              #[test]
+              fn the_letterbox_does_not_depend_on_the_scale_hack() {
+                  // `--scale-hack=N` multiplies the emulated screen by a whole number to
+                  // raise the render resolution. It must not move or resize the
+                  // letterbox: the guest's own coordinates (and therefore every touch)
+                  // stay in unscaled points.
+                  let base = fit_viewport((480, 320), DRAWABLE);
+                  assert_eq!(base, (430, 0, 1935, 1290));
+                  for n in 1..=4u32 {
+                      assert_eq!(fit_viewport((480 * n, 320 * n), DRAWABLE), base);
+                  }
+                  // ...and it must not change the guest size the touches are reported
+                  // in either; that one is deliberately unscaled (`Window::
+                  // touch_guest_size`), which is why the input path never multiplies by
+                  // it.
+                  assert_eq!(window_to_drawable((480.0, 320.0), (480, 320), (480, 320)), (480.0, 320.0));
+              }
+          
+              #[test]
+              fn touch_trace_is_throttled() {
+                  assert!((0..TOUCH_TRACE_FIRST).all(should_log_touch_trace));
+                  assert!(!should_log_touch_trace(TOUCH_TRACE_FIRST));
+                  assert!(!should_log_touch_trace(TOUCH_TRACE_EVERY - 1));
+                  assert!(should_log_touch_trace(TOUCH_TRACE_EVERY));
+                  assert!(should_log_touch_trace(2 * TOUCH_TRACE_EVERY));
+                  // 10,000 touches produce 139 lines, not 10,000: the first 40 in full,
+                  // then the multiples of 100 from 100 up to 9900.
+                  assert_eq!(
+                      (0..10_000).filter(|&n| should_log_touch_trace(n)).count(),
+                      TOUCH_TRACE_FIRST as usize + (10_000 / TOUCH_TRACE_EVERY - 1) as usize
+                  );
+              }
+          
+              #[test]
+              fn input_is_the_exact_inverse_of_the_presentation() {
+                  let viewport = landscape_viewport();
+                  let mut checked = 0;
+                  for gx in [0.0f32, 1.0, 40.0, 160.0, 319.0, 320.0 - 1.0] {
+                      for gy in [0.0f32, 1.0, 30.0, 240.0, 479.0, 480.0 - 1.0] {
+                          let screen = presenter_guest_to_screen(viewport, GUEST, (gx, gy));
+                          let back = input_screen_to_guest(viewport, GUEST, screen);
+                          // Rounding to whole guest points, as the real input path does.
+                          assert!(
+                              (back.0.round() - gx).abs() <= 1.0 && (back.1.round() - gy).abs() <= 1.0,
+                              "guest ({gx}, {gy}) came back as {back:?} through {screen:?}"
+                          );
+                          checked += 1;
+                      }
+                  }
+                  assert_eq!(checked, 36);
+              }
+          
+              #[test]
+              fn letterboxed_input_is_also_the_inverse_of_the_presentation() {
+                  // Same check on a window where the content is *not* flush with the
+                  // drawable in either axis, i.e. bars on all four sides.
+                  let viewport = fit_viewport((480, 320), (1280, 1290));
+                  assert_eq!(viewport, (0, 218, 1280, 853));
+                  // The guests' own axes are 320 (x) by 480 (y): this is the portrait
+                  // space the presenter rotates into the landscape viewport.
+                  for gx in [0.0f32, 100.0, 319.0] {
+                      for gy in [0.0f32, 100.0, 479.0] {
+                          let screen = presenter_guest_to_screen(viewport, GUEST, (gx, gy));
+                          let back = input_screen_to_guest(viewport, GUEST, screen);
+                          assert!(
+                              (back.0 - gx).abs() <= 1.0 && (back.1 - gy).abs() <= 1.0,
+                              "guest ({gx}, {gy}) came back as {back:?}"
+                          );
+                      }
+                  }
+              }
+          }
+          '''
+          
+          MOD_DECL_OLD = """use std::time::{Duration, Instant};
+          
+          #[allow(non_camel_case_types)]"""
+          
+          MOD_DECL_NEW = """use std::time::{Duration, Instant};
+          
+          mod geometry;
+          
+          #[allow(non_camel_case_types)]"""
+          
+          VIEWPORT_OLD = """    pub fn viewport(&self) -> (u32, u32, u32, u32) {
+                  let (app_width, app_height) =
+                      size_for_orientation_from_size(self.screen_size(), self.device_orientation, self.scale_hack);
+                  if !self.fullscreen && !Self::rotatable_fullscreen() {
+                      return (0, 0, app_width, app_height);
+                  }
+          
+                  let (screen_width, screen_height) = self.window.drawable_size();
+          
+                  let app_aspect = app_width as f32 / app_height as f32;
+                  let screen_aspect = screen_width as f32 / screen_height as f32;
+                  let (scaled_width, scaled_height) = if app_aspect < screen_aspect {
+                      (
+                          (screen_height as f32 * app_aspect).round() as u32,
+                          screen_height,
+                      )
+                  } else {
+                      (
+                          screen_width,
+                          (screen_width as f32 / app_aspect).round() as u32,
+                      )
+                  };
+                  let x = (screen_width - scaled_width) / 2;
+                  let y = (screen_height - scaled_height) / 2;
+                  (x, y, scaled_width, scaled_height)
+              }
+          """
+          
+          VIEWPORT_NEW = """    pub fn viewport(&self) -> (u32, u32, u32, u32) {
+                  if !self.fullscreen && !Self::rotatable_fullscreen() {
+                      // Windowed on the desktop: the window itself was created with this
+                      // size (see `Window::new`), so the app is presented into all of it.
+                      let (app_width, app_height) = size_for_orientation_from_size(
+                          self.screen_size(),
+                          self.device_orientation,
+                          self.scale_hack,
+                      );
+                      return (0, 0, app_width, app_height);
+                  }
+          
+                  // The presenter stretches the *whole* guest screen into this
+                  // rectangle, so its aspect ratio has to be the guest screen's aspect
+                  // ratio, i.e. what `-[UIScreen bounds]` reports. (The scale is still
+                  // not necessarily an integer, and the rectangle is only ever centred
+                  // inside the drawable: the input path must not assume either.)
+                  //
+                  // Neither of the two options that used to take part may:
+                  //
+                  // - `--screen-size=` changes which host window is created, not what the
+                  //   guest is told its screen is (see `Window::touch_guest_size`).
+                  //   Letting it in stretched the picture *and* made the input path
+                  //   report touches in a differently sized guest screen.
+                  // - `--scale-hack=` is a render-resolution multiplier with the same
+                  //   aspect ratio, so it must not take part in the letterbox either.
+                  //
+                  // [PATCH_V13_TOUCH_MAPPING]
+                  geometry::fit_viewport(self.guest_screen_size(), self.window.drawable_size())
+              }
+          
+              /// The guest screen size for the current device orientation, without the
+              /// render-resolution multiplier: the aspect ratio the app's content has,
+              /// and therefore the aspect ratio the presenter letterboxes it into.
+              /// [PATCH_V13_TOUCH_MAPPING]
+              pub fn guest_screen_size(&self) -> (u32, u32) {
+                  size_for_orientation_from_size(
+                      self.touch_guest_size(),
+                      self.device_orientation,
+                      NonZeroU32::new(1).unwrap(),
+                  )
+              }
+          
+              /// [Self::viewport], in the y-down space SDL reports input coordinates in.
+              ///
+              /// `glViewport()` measures y from the bottom edge of the drawable and SDL
+              /// events from the top. Because [geometry::fit_viewport] centres the
+              /// content vertically the two agree for every window the emulator creates
+              /// today, so this is currently a no-op; routing the input path through it
+              /// anyway means it stays correct if that ever stops being true.
+              /// [PATCH_V13_TOUCH_MAPPING]
+              pub fn viewport_for_input(&self) -> (u32, u32, u32, u32) {
+                  let drawable_height = self.window.drawable_size().1;
+                  geometry::gl_to_top_down_viewport(self.viewport(), drawable_height)
+              }
+          
+              /// The guest screen size that input coordinates are reported in.
+              ///
+              /// This is the guest space the compositor draws the app into, i.e. what
+              /// `-[UIScreen bounds]` tells the guest (see
+              /// `frameworks::uikit::ui_screen::screen_size_for_current_orientation`):
+              /// the emulated device's portrait size, swapped when the
+              /// `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` compatibility mode is on and the
+              /// device is in a landscape orientation. It has to stay in lockstep with
+              /// that function — reporting touches in a differently sized guest screen
+              /// scales every tap.
+              /// [PATCH_V13_TOUCH_MAPPING]
+              pub fn touch_guest_size(&self) -> (u32, u32) {
+                  let (portrait_width, portrait_height) = self.device_family.portrait_size();
+                  let is_landscape = !matches!(self.device_orientation, DeviceOrientation::Portrait);
+                  if std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some() && is_landscape {
+                      (portrait_height, portrait_width)
+                  } else {
+                      (portrait_width, portrait_height)
+                  }
+              }
+          """
+          
+          INPUT_VIEWPORT_OLD = """                (0, 0, width, height)
+                      } else {
+                          window.viewport()
+                      };"""
+          
+          INPUT_VIEWPORT_NEW = """                (0, 0, width, height)
+                      } else {
+                          // The rectangle the presenter drew the app into, in SDL's
+                          // top-down y. [PATCH_V13_TOUCH_MAPPING]
+                          window.viewport_for_input()
+                      };"""
+          
+          INPUT_NORMALIZE_OLD = """            let in_x = in_x.clamp(vx as f32, (vx + vw) as f32);
+                      let in_y = in_y.clamp(vy as f32, (vy + vh) as f32);
+                      // normalize to unit square centred on origin
+                      let x = (in_x - vx as f32) / vw as f32 - 0.5;
+                      let y = (in_y - vy as f32) / vh as f32 - 0.5;"""
+          
+          INPUT_NORMALIZE_NEW = """            // Clamp into the viewport and normalise to a unit square centred
+                      // on the origin. [PATCH_V13_TOUCH_MAPPING]
+                      let (x, y) = geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh));"""
+          
+          INPUT_OUT_OLD = """            // back to pixels
+                      let (out_w, out_h) = window.size_unrotated_unscaled();"""
+          
+          INPUT_OUT_NEW = """            // back to pixels, in the guest screen the app draws into (which
+                      // is what -[UIScreen bounds] reports, not whatever --screen-size=
+                      // asked the window for). [PATCH_V13_TOUCH_MAPPING]
+                      let (out_w, out_h) = window.touch_guest_size();"""
+          
+          INPUT_TRACE_OLD = """            let max_x = (out_w.saturating_sub(1)) as f32;
+                      let max_y = (out_h.saturating_sub(1)) as f32;
+                      let out_x = out_x.clamp(0.0, max_x);
+                      let out_y = out_y.clamp(0.0, max_y);
+                      // Round to match touch precision of official devices.
+                      (out_x.round(), out_y.round())"""
+          
+          INPUT_TRACE_NEW = """            let max_x = (out_w.saturating_sub(1)) as f32;
+                      let max_y = (out_h.saturating_sub(1)) as f32;
+                      let out_x = out_x.clamp(0.0, max_x);
+                      let out_y = out_y.clamp(0.0, max_y);
+                      // Optional diagnostic. On iOS the user cannot set an environment
+                      // variable, so this is also reachable as --trace-touch-map in the
+                      // app's options file (see options.rs); either switch turns it on.
+                      // It prints the geometry and the mapped point so that a report of
+                      // "taps land in the wrong place" can be checked against numbers
+                      // instead of guessed at. The first touch events are logged in
+                      // full, then a summary line every so often, so leaving it on for a
+                      // long session cannot flood the log. [PATCH_V13_TOUCH_MAPPING]
+                      {
+                          static TRACE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                          static TRACE_COUNT: std::sync::atomic::AtomicU64 =
+                              std::sync::atomic::AtomicU64::new(0);
+                          let trace_enabled = window.trace_touch_map
+                              || *TRACE_ENV.get_or_init(|| {
+                                  let on = std::env::var_os("TOUCHHLE_TRACE_TOUCH_MAP").is_some();
+                                  if on {
+                                      log!("TOUCHHLE_TRACE_TOUCH_MAP is set: tracing the touch mapping");
+                                  }
+                                  on
+                              });
+                          if trace_enabled {
+                              let n = TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                              if geometry::should_log_touch_trace(n) {
+                                  let (window_w, window_h) = window.window.size();
+                                  let (drawable_w, drawable_h) = window.window.drawable_size();
+                                  log!(
+                                      "TOUCHHLE_TRACE_TOUCH_MAP: #{} host=({:.1},{:.1}) window={}x{} drawable={}x{} viewport=({},{},{},{}) guest={}x{} -> ({:.1},{:.1})",
+                                      n + 1,
+                                      in_x, in_y,
+                                      window_w, window_h,
+                                      drawable_w, drawable_h,
+                                      vx, vy, vw, vh,
+                                      out_w, out_h,
+                                      out_x, out_y,
+                                  );
+                              }
+                          }
+                      }
+                      // Round to match touch precision of official devices.
+                      (out_x.round(), out_y.round())"""
+          
+          MOUSE_DOWN_OLD = """                E::MouseButtonDown {
+                              x,
+                              y,
+                              mouse_btn: MouseButton::Left,
+                              ..
+                          } => {
+                              let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                              log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);"""
+          
+          MOUSE_DOWN_NEW = """                E::MouseButtonDown {
+                              x,
+                              y,
+                              mouse_btn: MouseButton::Left,
+                              ..
+                          } => {
+                              // SDL mouse positions are window coordinates (points); the
+                              // viewport and the finger path are drawable pixels.
+                              // [PATCH_V13_TOUCH_MAPPING]
+                              let (x, y) = geometry::window_to_drawable(
+                                  (x as f32, y as f32),
+                                  self.window.size(),
+                                  self.window.drawable_size(),
+                              );
+                              let coords = transform_input_coords(self, (x, y), false);
+                              log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);"""
+          
+          MOUSE_MOVE_OLD = """                E::MouseMotion {
+                              x, y, mousestate, ..
+                          } if mousestate.left() => {
+                              let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                              log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);"""
+          
+          MOUSE_MOVE_NEW = """                E::MouseMotion {
+                              x, y, mousestate, ..
+                          } if mousestate.left() => {
+                              // See the MouseButtonDown arm: window points, not pixels.
+                              // [PATCH_V13_TOUCH_MAPPING]
+                              let (x, y) = geometry::window_to_drawable(
+                                  (x as f32, y as f32),
+                                  self.window.size(),
+                                  self.window.drawable_size(),
+                              );
+                              let coords = transform_input_coords(self, (x, y), false);
+                              log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);"""
+          
+          MOUSE_UP_OLD = """                E::MouseButtonUp {
+                              x,
+                              y,
+                              mouse_btn: MouseButton::Left,
+                              ..
+                          } => {
+                              let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                              log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);"""
+          
+          MOUSE_UP_NEW = """                E::MouseButtonUp {
+                              x,
+                              y,
+                              mouse_btn: MouseButton::Left,
+                              ..
+                          } => {
+                              // See the MouseButtonDown arm: window points, not pixels.
+                              // [PATCH_V13_TOUCH_MAPPING]
+                              let (x, y) = geometry::window_to_drawable(
+                                  (x as f32, y as f32),
+                                  self.window.size(),
+                                  self.window.drawable_size(),
+                              );
+                              let coords = transform_input_coords(self, (x, y), false);
+                              log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);"""
+          
+          VIRT_ACCEL_OLD = """                E::MouseButtonDown {
+                              x,
+                              y,
+                              mouse_btn: MouseButton::Right,
+                              ..
+                          } => {
+                              let (x, y) = transform_virt_accel_coords(self, (x, y));
+                              self.virtual_accelerometer_last = Some((x, y, true));
+                          }
+                          E::MouseMotion {
+                              x, y, mousestate, ..
+                          } => {
+                              if mousestate.right() {
+                                  let (x, y) = transform_virt_accel_coords(self, (x, y));
+                                  self.virtual_accelerometer_last = Some((x, y, true));
+                              }
+                          }"""
+          
+          VIRT_ACCEL_NEW = """                E::MouseButtonDown {
+                              x,
+                              y,
+                              mouse_btn: MouseButton::Right,
+                              ..
+                          } => {
+                              // Window points again. [PATCH_V13_TOUCH_MAPPING]
+                              let (x, y) = geometry::window_to_drawable(
+                                  (x as f32, y as f32),
+                                  self.window.size(),
+                                  self.window.drawable_size(),
+                              );
+                              let (x, y) = transform_virt_accel_coords(self, (x as i32, y as i32));
+                              self.virtual_accelerometer_last = Some((x, y, true));
+                          }
+                          E::MouseMotion {
+                              x, y, mousestate, ..
+                          } => {
+                              if mousestate.right() {
+                                  // Window points again. [PATCH_V13_TOUCH_MAPPING]
+                                  let (x, y) = geometry::window_to_drawable(
+                                      (x as f32, y as f32),
+                                      self.window.size(),
+                                      self.window.drawable_size(),
+                                  );
+                                  let (x, y) = transform_virt_accel_coords(self, (x as i32, y as i32));
+                                  self.virtual_accelerometer_last = Some((x, y, true));
+                              }
+                          }"""
+          
+          # `--trace-touch-map`: on iOS the user cannot set an environment variable for
+          # the app, so the diagnostic must also be reachable through the ordinary option
+          # mechanism (the per-app line in Documents/touchHLE_options.txt, or the command
+          # line) - the same mechanism `--print-fps` already uses.
+          OPTIONS_RS = "src/options.rs"
+          HELP_TXT = "OPTIONS_HELP.txt"
+          
+          OPTION_FIELD_OLD = """    pub trace_gl_errors: bool,\n"""
+          
+          OPTION_FIELD_NEW = """    pub trace_gl_errors: bool,
+              /// Log how each host touch (or mouse position) is mapped into guest
+              /// coordinates: the raw position, the window and drawable (Retina) sizes,
+              /// the rectangle the picture is presented in, the guest screen size the
+              /// position is reported in, and the result. The same switch as the
+              /// `TOUCHHLE_TRACE_TOUCH_MAP` environment variable, which desktop hosts
+              /// can set but an iOS user cannot; either one turns it on. Diagnostic only.
+              /// [PATCH_V13_TOUCH_MAPPING]
+              pub trace_touch_map: bool,
+          """
+          
+          OPTION_DEFAULT_OLD = """            trace_gl_errors: false,\n"""
+          
+          OPTION_DEFAULT_NEW = """            trace_gl_errors: false,
+                      trace_touch_map: false,
+          """
+          
+          OPTION_PARSE_OLD = """        } else if arg == "--trace-gl-errors" {
+                      self.trace_gl_errors = true;
+          """
+          
+          OPTION_PARSE_NEW = """        } else if arg == "--trace-gl-errors" {
+                      self.trace_gl_errors = true;
+                  } else if arg == "--trace-touch-map" {
+                      self.trace_touch_map = true;
+          """
+          
+          HELP_OLD = """    --fix-texture-min-filter
+          """
+          
+          HELP_NEW = """    --trace-touch-map
+                  Log how the host's touches (and mouse positions) are mapped into the
+                  guest's coordinates. Each line has the raw host position, the window
+                  and drawable (Retina) sizes, the rectangle the app's picture is
+                  presented in, the guest screen size the position is reported in, and
+                  the resulting guest position. Useful when taps or clicks land
+                  somewhere other than where the app drew the target. The first 40
+                  events are logged in full, then one line out of every 100, so it is
+                  safe to leave on for a whole session. On desktop hosts the same
+                  switch is available as the TOUCHHLE_TRACE_TOUCH_MAP environment
+                  variable.
+                  Diagnostic only; normally there is no reason to enable it.
+          
+              --fix-texture-min-filter
+          """
+          
+          # The option reaches the input path through a copy on `Window` (the touch
+          # mapping runs inside `poll_for_events`, which has no `Options` at hand; the
+          # existing `landscape_both_directions` field sets the precedent).
+          WINDOW_OPTION_FIELD_OLD = """    landscape_both_directions: bool,\n"""
+          
+          WINDOW_OPTION_FIELD_NEW = """    landscape_both_directions: bool,
+              /// Copy of `Options::trace_touch_map`: log how host touches are mapped into
+              /// guest coordinates. See there for why it is not only read from the
+              /// environment. [PATCH_V13_TOUCH_MAPPING]
+              trace_touch_map: bool,
+          """
+          
+          WINDOW_OPTION_INIT_OLD = """            landscape_both_directions: options.landscape_both_directions,\n"""
+          
+          WINDOW_OPTION_INIT_NEW = """            landscape_both_directions: options.landscape_both_directions,
+                      trace_touch_map: options.trace_touch_map,
+          """
+          
+          EDITS = [
+              ("the geometry module is declared", WINDOW_RS, MOD_DECL_OLD, MOD_DECL_NEW, True),
+              ("the trace-touch-map option is copied onto the window", WINDOW_RS, WINDOW_OPTION_FIELD_OLD, WINDOW_OPTION_FIELD_NEW, True),
+              ("the trace-touch-map option is initialised", WINDOW_RS, WINDOW_OPTION_INIT_OLD, WINDOW_OPTION_INIT_NEW, True),
+              ("viewport() delegates to geometry::fit_viewport", WINDOW_RS, VIEWPORT_OLD, VIEWPORT_NEW, True),
+              ("the input path uses the presenter's rect", WINDOW_RS, INPUT_VIEWPORT_OLD, INPUT_VIEWPORT_NEW, True),
+              ("the input path normalises with geometry::normalize_viewport_coords", WINDOW_RS, INPUT_NORMALIZE_OLD, INPUT_NORMALIZE_NEW, True),
+              ("the input path reports in the guest screen the app draws into", WINDOW_RS, INPUT_OUT_OLD, INPUT_OUT_NEW, True),
+              ("the input path can trace its mapping", WINDOW_RS, INPUT_TRACE_OLD, INPUT_TRACE_NEW, True),
+              ("SDL mouse positions are converted to drawable pixels (left button down)", WINDOW_RS, MOUSE_DOWN_OLD, MOUSE_DOWN_NEW, True),
+              ("SDL mouse positions are converted to drawable pixels (drag)", WINDOW_RS, MOUSE_MOVE_OLD, MOUSE_MOVE_NEW, True),
+              ("SDL mouse positions are converted to drawable pixels (left button up)", WINDOW_RS, MOUSE_UP_OLD, MOUSE_UP_NEW, True),
+              ("SDL mouse positions are converted to drawable pixels (virtual accelerometer)", WINDOW_RS, VIRT_ACCEL_OLD, VIRT_ACCEL_NEW, True),
+              ("--trace-touch-map is an option", OPTIONS_RS, OPTION_FIELD_OLD, OPTION_FIELD_NEW, True),
+              ("--trace-touch-map defaults to off", OPTIONS_RS, OPTION_DEFAULT_OLD, OPTION_DEFAULT_NEW, True),
+              ("--trace-touch-map parses", OPTIONS_RS, OPTION_PARSE_OLD, OPTION_PARSE_NEW, True),
+              ("--trace-touch-map is documented in OPTIONS_HELP.txt (what --help prints)",
+               HELP_TXT, HELP_OLD, HELP_NEW, False),
+          ]
+          
+          # Functions/anchors that the wiring check must find afterwards.
+          EXPECTED = [
+              (WINDOW_RS, "mod geometry;"),
+              (WINDOW_RS, "pub fn viewport_for_input(&self)"),
+              (WINDOW_RS, "pub fn touch_guest_size(&self)"),
+              (WINDOW_RS, "window.viewport_for_input()"),
+              (WINDOW_RS, "geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh))"),
+              (WINDOW_RS, "let (out_w, out_h) = window.touch_guest_size();"),
+              (WINDOW_RS, "TOUCHHLE_TRACE_TOUCH_MAP: #{} host="),
+              (WINDOW_RS, 'TOUCHHLE_TRACE_TOUCH_MAP is set: tracing the touch mapping'),
+              (GEOMETRY_RS, "pub(super) fn fit_viewport("),
+              (GEOMETRY_RS, "pub(super) fn window_to_drawable("),
+              (GEOMETRY_RS, "pub(super) fn gl_to_top_down_viewport("),
+              (GEOMETRY_RS, "pub(super) fn normalize_viewport_coords("),
+              (GEOMETRY_RS, "fn input_is_the_exact_inverse_of_the_presentation()"),
+              (GEOMETRY_RS, "fn fit_viewport_matches_the_measured_dnf_geometry()"),
+              (OPTIONS_RS, "pub trace_touch_map: bool,"),
+              (OPTIONS_RS, "trace_touch_map: false,"),
+              (OPTIONS_RS, 'arg == "--trace-touch-map"'),
+              (WINDOW_RS, "pub fn guest_screen_size(&self)"),
+              (WINDOW_RS, "    trace_touch_map: bool,"),
+              (WINDOW_RS, "trace_touch_map: options.trace_touch_map,"),
+              (WINDOW_RS, "geometry::fit_viewport(self.guest_screen_size(), self.window.drawable_size())"),
+              (WINDOW_RS, "geometry::should_log_touch_trace(n)"),
+              (WINDOW_RS, "window.trace_touch_map"),
+              (GEOMETRY_RS, "pub(super) fn should_log_touch_trace("),
+              ("?" + HELP_TXT, "    --trace-touch-map"),
+          ]
+          
+          MOUSE_ARMS = [
+              "SDL mouse positions are converted to drawable pixels (left button down)",
+              "SDL mouse positions are converted to drawable pixels (drag)",
+              "SDL mouse positions are converted to drawable pixels (left button up)",
+              "SDL mouse positions are converted to drawable pixels (virtual accelerometer)",
+          ]
+          
+          
+          def fail(message):
+              print("patch_touch_mapping_v13: error: " + message, file=sys.stderr)
+              sys.exit(1)
+          
+          
+          def brace_balance(text, path):
+              """The inserted/replaced code must keep the file's braces balanced."""
+              depth = 0
+              for character in text:
+                  if character == "{":
+                      depth += 1
+                  elif character == "}":
+                      depth -= 1
+                  if depth < 0:
+                      fail("{} has a closing brace with no opener".format(path))
+              if depth != 0:
+                  fail("{} has {} unclosed braces".format(path, depth))
+          
+          
+          def apply_edit(path, old, new, description):
+              original = path.read_text(encoding="utf-8")
+              count = original.count(old)
+              if count != 1:
+                  fail(
+                      "expected exactly one occurrence of the anchor for '{}' in {}, found {} "
+                      "(is this the pinned tree with patches A-K applied?)".format(
+                          description, path, count
+                      )
+                  )
+              text = original.replace(old, new, 1)
+              if path.suffix == ".rs":
+                  brace_balance(text, str(path))
+              path.write_text(text, encoding="utf-8", newline="\n")
+          
+          
+          def check(path):
+              text = path.read_text(encoding="utf-8")
+              brace_balance(text, str(path))
+              if "TODO" in text and path.name == "geometry.rs":
+                  fail("{} still contains a TODO".format(path))
+          
+          
+          def main():
+              root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
+              window = root / WINDOW_RS
+              geometry = root / GEOMETRY_RS
+          
+              if not window.is_file():
+                  fail("{} not found; point me at the repository root".format(window))
+          
+              window_text = window.read_text(encoding="utf-8")
+          
+              if MARKER in window_text:
+                  print("The shared touch/render geometry is already in place; nothing to do")
+              else:
+                  # Pre-flight: every anchor must be present exactly once, and a
+                  # geometry.rs we did not write must not be sitting there, so a tree in
+                  # an unexpected state fails *before* anything is modified.
+                  for description, relative, old, _new, required in EDITS:
+                      # Doc-only files (OPTIONS_HELP.txt) may be missing from a minimal
+                      # tree; everything that carries code must be there.
+                      if not required and not (root / relative).is_file():
+                          continue
+                      text = (root / relative).read_text(encoding="utf-8")
+                      count = text.count(old)
+                      if count != 1:
+                          fail(
+                              "expected exactly one occurrence of the anchor for '{}' in {}, "
+                              "found {} (is this the pinned tree with patches A-K applied?)".format(
+                                  description, relative, count
+                              )
+                          )
+                  if geometry.is_file() and MARKER not in geometry.read_text(encoding="utf-8"):
+                      fail(
+                          "{} exists but was not written by this patch; refusing to touch it".format(
+                              GEOMETRY_RS
+                          )
+                      )
+          
+                  if not geometry.is_file():
+                      geometry.parent.mkdir(parents=True, exist_ok=True)
+                      geometry.write_text(GEOMETRY_SRC.replace("PATCH_V13_TOUCH_MAPPING", MARKER), encoding="utf-8", newline="\n")
+                      print("created: G1 {} ({} bytes)".format(GEOMETRY_RS, geometry.stat().st_size))
+                  for description, relative, old, new, required in EDITS:
+                      if not required and not (root / relative).is_file():
+                          print("skipped (file absent): {} ({})".format(description, relative))
+                          continue
+                      apply_edit(root / relative, old, new, description)
+                      print("applied: {} ({})".format(description, relative))
+          
+              # ---- wiring check -------------------------------------------------
+              print("")
+              print("wiring (file:line):")
+              failures = []
+              for relative, needle in EXPECTED:
+                  optional = relative.startswith("?")
+                  relative = relative.lstrip("?")
+                  path = root / relative
+                  if not path.is_file():
+                      if optional:
+                          print("  (absent, skipped) {}".format(relative))
+                          continue
+                      failures.append("{} is missing".format(relative))
+                      continue
+                  text = path.read_text(encoding="utf-8")
+                  if needle not in text:
+                      failures.append("{} in {}".format(needle, relative))
+                      continue
+                  line = text[: text.index(needle)].count("\n") + 1
+                  print("  {}:{}  {}".format(relative, line, needle))
+              if failures:
+                  fail("missing after patching: " + "; ".join(failures))
+          
+              # The mouse arms must all convert before they call transform_input_coords.
+              for relative, _ in [(WINDOW_RS, "")]:
+                  text = (root / relative).read_text(encoding="utf-8")
+                  if text.count("geometry::window_to_drawable(") != 5:
+                      fail(
+                          "expected 5 window_to_drawable() call sites (4 mouse arms, 1 helper use), found {}".format(
+                              text.count("geometry::window_to_drawable(")
+                          )
+                      )
+              for name in MOUSE_ARMS:
+                  print("  arm converted: {}".format(name))
+          
+              check(root / WINDOW_RS)
+              check(root / GEOMETRY_RS)
+              check(root / OPTIONS_RS)
+              print("")
+              print("post-check: the conversions live in {}, both ends call it, and the changed files' braces balance.".format(GEOMETRY_RS))
+              print("post-check: for the pinned configuration (no --screen-size=) every touch coordinate is unchanged.")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PATCH_V13_TOUCH_MAPPING_PY
+          python3 - <<'PATCH_V14_CJK_TEXT_PY'
+          #!/usr/bin/env python3
+          """Make the CJK/Arabic font fallback reach the CoreText and CoreGraphics text paths.
+          
+          The problem
+          -----------
+          The core already knows that the bundled Latin/serif/mono fonts cannot render
+          CJK or Arabic text: `src/frameworks/uikit/ui_font.rs` classifies the codepoints
+          of a string (`is_cjk_char` / `is_arabic_char`) and substitutes
+          `NotoSansSC-Regular.otf` / `NotoSansSC-Bold.otf` (or the Noto Arabic faces)
+          before it measures or draws.
+          
+          That mechanism was only wired into the `UIFont` / `NSString` text APIs. The
+          CoreText and CoreGraphics text paths build their `Font` straight from a
+          `UIFont`'s *kind*:
+          
+              let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);
+          
+          `font_from_uifont` cannot see the text, so a string like "地下城与勇士" was laid
+          out and rasterised with Liberation Sans, which has no CJK glyphs: every
+          character became `.notdef`, which is the "one empty box per character" (tofu)
+          that the app under test shows for Chinese, Japanese and Korean while its
+          English text renders correctly.
+          
+          What this script changes
+          -----------------------
+          1. `src/frameworks/uikit/ui_font.rs`: the classification and the fallback
+             selection are made reusable instead of being private to one module. The
+             existing `get_font`, which is the *single* implementation of "which face does
+             this text need", becomes `pub(crate)`; `FontKind` and `State` become
+             `pub(crate)` so the kind can be passed in; `font_kind_from_uifont` is added
+             next to `font_from_uifont`; a rate-limited `CJKFONT` trace line names the
+             substitution. `get_font`'s body is otherwise unchanged (`is_bold` moves into
+             a small helper so both the fallback test and the log can use it), and the
+             CJK-over-Arabic priority is preserved.
+          2. `src/frameworks.rs` + `src/frameworks/uikit.rs`: the state field is made
+             `pub(crate)` and a `State::font_for_text` method exposes the cached lookup, so
+             callers outside the UIKit module can use it *without* re-parsing an 8 MB Noto
+             file per call and without any second copy of the classification logic.
+          3. `src/frameworks/core_text.rs`: the four places that have the text in hand and
+             then build a font from a `UIFont` become text-aware. This is the fix:
+             `CTLineDraw` (the actual drawing call), `CTLineGetTypographicBounds` and
+             `CTLineGetImageBounds` (the measurement used to lay the string out) and
+             `CTFramesetterSuggestFrameSizeWithConstraints`.
+          4. `src/frameworks/core_graphics/cg_context.rs`: the three glyph-id drawing
+             entry points get a rate-limited `CJKNODEF` diagnostic. They draw glyph ids,
+             not characters, so they *cannot* select a fallback font at all - see
+             "What cannot be fixed here" below.
+          
+          What cannot be fixed here (and why)
+          -----------------------------------
+          * `CGContextShowGlyphsAtPoint` / `...AtPositions` / `...WithAdvances`
+            (and `CGContextShowGlyphs`, which delegates to the first) receive
+            `CGGlyph` ids, which are **only meaningful relative to the font that produced
+            them**: the same number is a different glyph in a different font, and glyph id
+            0 is `.notdef` in every font. By the time these functions run, the character
+            is gone; there is nothing to classify and therefore no sound way to pick
+            Noto Sans SC here. Rewriting the ids with a CJK font would render arbitrary
+            wrong glyphs, not the requested ones, so the only honest thing this layer can
+            do is report a run that is drawing `.notdef`. The `CJKNODEF` line does that,
+            which is also the one piece of evidence a device log can give about whether
+            the app draws its text through this path at all.
+          * `CGContextShowTextAtPoint` and `CGContextShowText` are **empty stubs** in this
+            tree (as is `CGContextSelectFont`): they take `_env` / `_context` / `_string`
+            and do nothing, so they draw neither Latin nor CJK text and cannot be the
+            source of the boxes. There is no font choice to make in them, and implementing
+            them would be a new feature, not a fix.
+          * `CTFontGetGlyphsForCharacters` (`core_text.rs`) *does* see the characters, but
+            its output is a font-specific glyph id. Returning Noto Sans SC ids here while
+            the drawing font is still the Latin one reproduces the problem in a worse
+            form (wrong glyphs instead of empty boxes); ids that exceed the Latin font's
+            glyph count are `.notdef` again. It is deliberately left alone. Fixing the
+            glyph-id pipeline needs a link from the font that produced the ids to the font
+            the context draws with (e.g. remembering, per font object, which fallback face
+            its ids came from) - a design change, not a patch.
+          * `UIFont -capHeight` / `-xHeight` / `-ascender` / `-descender` / `-leading` use
+            `get_font_by_kind` without text. They are pure metrics of a font object, not of
+            a string, so there is no text to classify and nothing to change.
+          * `CGContextSetFont` cannot be made text-aware either: the text is not known
+            when the font is selected.
+          
+          No non-text behaviour is touched, and nothing in patches A-K is modified.
+          
+          Usage: python3 patch_cjk_text_fallback_v14.py [repo-root]   (default: .)
+          
+          The script refuses to run unless every edit applies cleanly, and re-checks the
+          result afterwards, so a silent no-op is impossible. Running it twice is a no-op.
+          """
+          
+          import sys
+          from pathlib import Path
+          
+          # Marks the patch. One per touched file: a file that already contains its marker
+          # is left alone, which is what makes a second run a no-op.
+          PATCH_MARKER = "Patch L (v14):"
+          
+          UI_FONT = "src/frameworks/uikit/ui_font.rs"
+          UIKIT = "src/frameworks/uikit.rs"
+          FRAMEWORKS = "src/frameworks.rs"
+          CORE_TEXT = "src/frameworks/core_text.rs"
+          CG_CONTEXT = "src/frameworks/core_graphics/cg_context.rs"
+          
+          # --------------------------------------------------------------------------
+          # 1. ui_font.rs: make the one text-aware lookup reusable
+          # --------------------------------------------------------------------------
+          
+          UI_FONT_OLD_KIND_DERIVE = r'''#[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
+          enum FontKind {
+          '''
+          
+          UI_FONT_NEW_KIND_DERIVE = r'''#[derive(Copy, Clone, Default, PartialEq, Eq, Hash, Debug)]
+          pub(crate) enum FontKind {
+          '''
+          
+          UI_FONT_OLD_STATE = r'''pub(super) struct State {
+          '''
+          
+          UI_FONT_NEW_STATE = r'''pub(crate) struct State {
+          '''
+          
+          UI_FONT_OLD_GET_FONT = r'''#[rustfmt::skip]
+          fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
+              let mut needs_cjk = false;
+              let mut needs_arabic = false;
+              for c in text.chars() {
+                  let c = c as u32;
+                  if is_cjk_char(c) {
+                      needs_cjk = true;
+                  } else if is_arabic_char(c) {
+                      needs_arabic = true;
+                  }
+              }
+          
+              // CJK takes priority over Arabic when both are present, matching the order
+              // in which fallbacks were historically added; the common case is text
+              // containing only one of the two scripts.
+              let is_bold = matches!(
+                  kind,
+                  FontKind::MonoBold | FontKind::MonoBoldItalic |
+                  FontKind::SansBold | FontKind::SansBoldItalic |
+                  FontKind::SerifBold | FontKind::SerifBoldItalic
+              );
+          
+             if needs_cjk {
+              if is_bold {
+                  return state.sans_bold_zh.get_or_insert_with(Font::sans_bold_zh);
+              }
+              return state.sans_regular_zh.get_or_insert_with(Font::sans_regular_zh);
+          }
+              if needs_arabic {
+                  if is_bold {
+                      return state.sans_bold_ar.get_or_insert_with(Font::sans_bold_ar);
+                  }
+                  return state.sans_regular_ar.get_or_insert_with(Font::sans_regular_ar);
+              }
+          
+              state.get_font_by_kind(kind)
+          }
+          '''
+          
+          UI_FONT_NEW_GET_FONT = r'''/// [FontKind]s whose fallback face is the bold one.
+          fn font_kind_is_bold(kind: FontKind) -> bool {
+              matches!(
+                  kind,
+                  FontKind::MonoBold | FontKind::MonoBoldItalic |
+                  FontKind::SansBold | FontKind::SansBoldItalic |
+                  FontKind::SerifBold | FontKind::SerifBoldItalic
+              )
+          }
+          
+          /// Rate-limited trace so a device run can confirm that a script-specific font
+          /// really was substituted, and for which kind of font it was requested.
+          ///
+          /// `log!` and not `log_dbg!`: `log::ENABLED_MODULES` is empty on purpose
+          /// (`src/log.rs`), so every debug-level log in this crate is suppressed on
+          /// device.
+          fn note_cjk_font(kind: FontKind, cjk_chars: usize) {
+              static CJKFONT_LOGGED: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              if CJKFONT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {
+                  return;
+              }
+              log!(
+                  "CJKFONT requested={:?} -> NotoSansSC ({} CJK chars)",
+                  kind,
+                  cjk_chars
+              );
+          }
+          
+          /// Patch L (v14): the one text-aware font lookup. `kind` picks the face, the
+          /// text decides whether a fallback face is needed at all. `pub(crate)` because
+          /// the CoreText and CoreGraphics text paths have to reach the same decision this
+          /// module already makes for `UIFont` text; this is the only implementation of
+          /// it.
+          #[rustfmt::skip]
+          pub(crate) fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
+              let mut cjk_chars = 0usize;
+              let mut needs_arabic = false;
+              for c in text.chars() {
+                  let c = c as u32;
+                  if is_cjk_char(c) {
+                      cjk_chars += 1;
+                  } else if is_arabic_char(c) {
+                      needs_arabic = true;
+                  }
+              }
+          
+              // CJK takes priority over Arabic when both are present, matching the order
+              // in which fallbacks were historically added; the common case is text
+              // containing only one of the two scripts.
+              let is_bold = font_kind_is_bold(kind);
+          
+              if cjk_chars > 0 {
+                  note_cjk_font(kind, cjk_chars);
+                  if is_bold {
+                      return state.sans_bold_zh.get_or_insert_with(Font::sans_bold_zh);
+                  }
+                  return state.sans_regular_zh.get_or_insert_with(Font::sans_regular_zh);
+              }
+              if needs_arabic {
+                  if is_bold {
+                      return state.sans_bold_ar.get_or_insert_with(Font::sans_bold_ar);
+                  }
+                  return state.sans_regular_ar.get_or_insert_with(Font::sans_regular_ar);
+              }
+          
+              state.get_font_by_kind(kind)
+          }
+          '''
+          
+          UI_FONT_OLD_CONVERT = r'''fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {
+          '''
+          
+          UI_FONT_NEW_CONVERT = r'''/// Patch L (v14): the [FontKind] of a UIFont, or `None` if `obj` is not a
+          /// UIFont.
+          ///
+          /// The same pre-check [font_from_uifont] does, but returning the kind instead of
+          /// a constructed [Font]: a caller that has the text in hand should pass the kind
+          /// to [get_font] so that the CJK/Arabic fallback applies.
+          pub(crate) fn font_kind_from_uifont(
+              env: &mut Environment,
+              obj: crate::objc::id,
+          ) -> Option<FontKind> {
+              if !is_uifont(env, obj) {
+                  return None;
+              }
+              Some(env.objc.borrow::<UIFontHostObject>(obj).kind)
+          }
+          
+          fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 2. frameworks.rs / uikit.rs: expose that lookup on the state
+          # --------------------------------------------------------------------------
+          
+          FRAMEWORKS_OLD = r'''    uikit: uikit::State,
+          }
+          '''
+          
+          FRAMEWORKS_NEW = r'''    // Patch L (v14): the CoreText/CoreGraphics text paths need the same
+              // text-aware font lookup the UIKit text APIs use.
+              pub(crate) uikit: uikit::State,
+          }
+          '''
+          
+          UIKIT_OLD = r'''    ui_responder: ui_responder::State,
+          }
+          '''
+          
+          UIKIT_NEW = r'''    ui_responder: ui_responder::State,
+          }
+          
+          impl State {
+              /// Patch L (v14): text-aware font lookup. `UIFont`'s own text APIs and the
+              /// CoreText / CoreGraphics text paths have to agree on when a run needs the
+              /// bundled Noto CJK/Arabic faces, so both go through [ui_font::get_font].
+              /// The fonts themselves live in this state, so a caller outside this module
+              /// gets the cached face instead of parsing an 8 MB Noto file.
+              pub(crate) fn font_for_text(
+                  &mut self,
+                  kind: ui_font::FontKind,
+                  text: &str,
+              ) -> &crate::font::Font {
+                  ui_font::get_font(&mut self.ui_font, kind, text)
+              }
+          }
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 3. core_text.rs: the four text-aware call sites
+          # --------------------------------------------------------------------------
+          
+          CORE_TEXT_OLD_IMPORT = (
+              "use crate::frameworks::uikit::ui_font::{font_from_uifont, is_uifont, draw_font_glyph};"
+          )
+          
+          CORE_TEXT_NEW_IMPORT = r'''// Patch L (v14): the CoreText text paths use the same text-aware font lookup as
+          // the UIKit ones, so a run containing CJK or Arabic text never falls through to
+          // a Latin face.
+          use crate::frameworks::uikit::ui_font::{
+              font_from_uifont, font_kind_from_uifont, is_uifont, draw_font_glyph, FontKind,
+          };'''
+          
+          # Identical at all four sites; each of them has `text_str` in scope and `font`
+          # bound to the line's UIFont.
+          CORE_TEXT_OLD_SITE = (
+              "    let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);\n"
+          )
+          CORE_TEXT_OLD_SITE_COUNT = 4
+          
+          CORE_TEXT_NEW_SITE = r'''    let font_kind = font_kind_from_uifont(env, font).unwrap_or(FontKind::SansRegular);
+              // Patch L (v14): the face is chosen from the text about to be measured or
+              // drawn, so CJK/Arabic runs use the Noto face. A non-UIFont still resolves to
+              // the same Latin face as before.
+              let font_obj = env.framework_state.uikit.font_for_text(font_kind, &text_str);
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 4. cg_context.rs: the glyph-id path can only report what it cannot do
+          # --------------------------------------------------------------------------
+          
+          CG_CONTEXT_OLD_FIRST_GLYPH_FN = r'''/// `void CGContextShowGlyphsAtPoint(CGContextRef c, CGFloat x, CGFloat y,
+          ///                                  const CGGlyph *glyphs, size_t count)`
+          fn CGContextShowGlyphsAtPoint(
+          '''
+          
+          CG_CONTEXT_NEW_FIRST_GLYPH_FN = r'''/// Rate-limited diagnostic for the glyph-id text entry points.
+          ///
+          /// `CGContextShowGlyphs*` receives glyph ids, not characters, so - unlike the
+          /// UIKit and CoreText text APIs - it cannot tell which script a run is in and
+          /// therefore cannot choose the Noto CJK/Arabic fallback: a glyph id is only
+          /// meaningful together with the font that produced it, and the same id in
+          /// another font is another glyph. Glyph id 0 is `.notdef`, the "empty box" a
+          /// Latin face produces for a character it does not have. Saying so is all this
+          /// layer can do, and it is what makes a device log answer whether the app draws
+          /// its text through this path at all.
+          ///
+          /// Patch L (v14): this is the whole of what can be done here.
+          fn note_notdef_glyphs(glyph_ids: &[rusttype::GlyphId], entry: &str) {
+              let notdef = glyph_ids.iter().filter(|id| id.0 == 0).count();
+              if notdef == 0 {
+                  return;
+              }
+              static CJKNODEF_LOGGED: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              if CJKNODEF_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {
+                  return;
+              }
+              log!(
+                  "CJKNODEF {} glyphs={} notdef={} (glyph ids carry no characters, so no fallback font can be chosen here)",
+                  entry,
+                  glyph_ids.len(),
+                  notdef
+              );
+          }
+          
+          /// `void CGContextShowGlyphsAtPoint(CGContextRef c, CGFloat x, CGFloat y,
+          ///                                  const CGGlyph *glyphs, size_t count)`
+          fn CGContextShowGlyphsAtPoint(
+          '''
+          
+          CG_CONTEXT_AT_POINT_OLD = r'''        glyph_ids.push(rusttype::GlyphId(glyph_id));
+              }
+          
+              let host = env.objc.borrow::<CGContextHostObject>(context);
+          '''
+          
+          CG_CONTEXT_AT_POINT_NEW = r'''        glyph_ids.push(rusttype::GlyphId(glyph_id));
+              }
+              note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPoint");
+          
+              let host = env.objc.borrow::<CGContextHostObject>(context);
+          '''
+          
+          CG_CONTEXT_AT_POSITIONS_OLD = r'''        pos_vec.push((pos.x, pos.y));
+              }
+          '''
+          
+          CG_CONTEXT_AT_POSITIONS_NEW = r'''        pos_vec.push((pos.x, pos.y));
+              }
+              note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPositions");
+          '''
+          
+          CG_CONTEXT_WITH_ADVANCES_OLD = r'''        advance_vec.push((adv.width, adv.height));
+              }
+          '''
+          
+          CG_CONTEXT_WITH_ADVANCES_NEW = r'''        advance_vec.push((adv.width, adv.height));
+              }
+              note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsWithAdvances");
+          '''
+          
+          # Post-conditions per file: (marker, expected count). `PATCH_MARKER` counts the
+          # marker comments the edits above insert, which is also how a partly applied file
+          # is detected.
+          POSTCONDITIONS = {
+              UI_FONT: (
+                  (PATCH_MARKER, 2),
+                  ("pub(crate) enum FontKind {", 1),
+                  ("pub(crate) struct State {", 1),
+                  ("pub(crate) fn get_font<'a>(state: &'a mut State", 1),
+                  ("fn get_font<'a>(state: &'a mut State", 1),
+                  ("pub(crate) fn font_kind_from_uifont(", 1),
+                  ("fn font_kind_is_bold(kind: FontKind) -> bool {", 1),
+                  ("if CJKFONT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {", 1),
+                  ('"CJKFONT requested={:?} -> NotoSansSC ({} CJK chars)",', 1),
+                  ("let is_bold = font_kind_is_bold(kind);", 1),
+                  # one implementation of the classification, used twice (two fallbacks)
+                  ("if is_cjk_char(c) {", 1),
+                  ("} else if is_arabic_char(c) {", 1),
+                  ("pub(super) enum FontKind {", 0),
+                  ("pub(super) struct State {", 0),
+                  # the pre-patch declaration, which had no `pub(crate)`
+                  ("\nfn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {", 0),
+              ),
+              FRAMEWORKS: (
+                  (PATCH_MARKER, 1),
+                  ("pub(crate) uikit: uikit::State,", 1),
+              ),
+              UIKIT: (
+                  (PATCH_MARKER, 1),
+                  ("pub(crate) fn font_for_text(", 1),
+                  ("ui_font::get_font(&mut self.ui_font, kind, text)", 1),
+              ),
+              CORE_TEXT: (
+                  (PATCH_MARKER, 5),
+                  ("font_kind_from_uifont,", 1),
+                  ("FontKind,\n};", 1),
+                  ("let font_kind = font_kind_from_uifont(env, font).unwrap_or(FontKind::SansRegular);", 4),
+                  ("env.framework_state.uikit.font_for_text(font_kind, &text_str);", 4),
+                  # The glyph-id producers keep their old behaviour on purpose (see the
+                  # module docstring): `font_from_uifont` is still used, but no longer on a
+                  # path that has the text.
+                  ("let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);", 1),
+                  ("let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);", 0),
+                  ("use crate::frameworks::uikit::ui_font::{font_from_uifont, is_uifont, draw_font_glyph};", 0),
+              ),
+              CG_CONTEXT: (
+                  (PATCH_MARKER, 1),
+                  ("fn note_notdef_glyphs(glyph_ids: &[rusttype::GlyphId], entry: &str) {", 1),
+                  ('"CJKNODEF {} glyphs={} notdef={} (glyph ids carry no characters, so no fallback font can be chosen here)",', 1),
+                  ("if CJKNODEF_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {", 1),
+                  ('note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPoint");', 1),
+                  ('note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPositions");', 1),
+                  ('note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsWithAdvances");', 1),
+                  ("fn CGContextShowTextAtPoint(", 1),
+                  ("fn CGContextShowText(", 1),
+                  ("fn CGContextSelectFont(", 1),
+              ),
+          }
+          
+          # The glyph-id draw functions, and the text entry points that are stubs in this
+          # tree. Asserted to be untouched so a later edit cannot quietly reintroduce a
+          # Latin-only font choice there without this script's post-conditions noticing.
+          UNTOUCHED_STUBS = {
+              CG_CONTEXT: (
+                  r'''fn CGContextShowTextAtPoint(
+              _env: &mut Environment,
+              _context: CGContextRef,
+              _x: CGFloat,
+              _y: CGFloat,
+              _string: crate::mem::ConstPtr<u8>,
+              _length: u32,
+          ) {
+          }
+          ''',
+                  r'''fn CGContextShowText(
+              _env: &mut Environment,
+              _context: CGContextRef,
+              _string: crate::mem::ConstPtr<u8>,
+              _length: u32,
+          ) {
+          }
+          ''',
+              ),
+              CORE_TEXT: (
+                  # `CTFontGetGlyphsForCharacters` still maps with the font object's own
+                  # face; its glyph ids must stay in that font's namespace.
+                  "    let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);\n",
+              ),
+          }
+          
+          
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+          
+          
+          def replace_once(text, old, new, what, count=1):
+              found = text.count(old)
+              if found != count:
+                  fail("cannot find {} ({} match(es), expected {}); is the tree unpatched?".format(
+                      what, found, count))
+              return text.replace(old, new, count)
+          
+          
+          def apply_to_file(path, edits):
+              """Applies the edits of one file, unless the file already carries the marker."""
+              original = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+              if PATCH_MARKER in original:
+                  return original, False
+              text = original
+              for old, new, what in edits:
+                  text = replace_once(text, old, new, what)
+              return text, True
+          
+          
+          def check(path, text):
+              """Everything that must hold of the patched file."""
+              if text.count("{") != text.count("}"):
+                  fail("{}: unbalanced braces: {} '{{' vs {} '}}'".format(
+                      path, text.count("{"), text.count("}")))
+              for marker, expected in POSTCONDITIONS[path]:
+                  count = text.count(marker)
+                  if count != expected:
+                      fail("{}: {!r} appears {} time(s), expected {}".format(
+                          path, marker, count, expected))
+              for untouched in UNTOUCHED_STUBS.get(path, ()):
+                  if untouched not in text:
+                      fail("{}: a block this patch must not touch is missing or was edited:\n{}".format(
+                          path, untouched))
+          
+          
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+          
+              edits_per_file = {
+                  UI_FONT: [
+                      (UI_FONT_OLD_KIND_DERIVE, UI_FONT_NEW_KIND_DERIVE, "the FontKind declaration"),
+                      (UI_FONT_OLD_STATE, UI_FONT_NEW_STATE, "the ui_font State declaration"),
+                      (UI_FONT_OLD_GET_FONT, UI_FONT_NEW_GET_FONT, "get_font"),
+                      (UI_FONT_OLD_CONVERT, UI_FONT_NEW_CONVERT, "convert_line_break_mode"),
+                  ],
+                  FRAMEWORKS: [
+                      (FRAMEWORKS_OLD, FRAMEWORKS_NEW, "the frameworks State uikit field"),
+                  ],
+                  UIKIT: [
+                      (UIKIT_OLD, UIKIT_NEW, "the end of the uikit State struct"),
+                  ],
+                  CORE_TEXT: [
+                      (CORE_TEXT_OLD_IMPORT, CORE_TEXT_NEW_IMPORT, "the ui_font import"),
+                      (CORE_TEXT_OLD_SITE, CORE_TEXT_NEW_SITE,
+                       "the {} font_from_uifont(env, font) sites".format(CORE_TEXT_OLD_SITE_COUNT)),
+                  ],
+                  CG_CONTEXT: [
+                      (CG_CONTEXT_OLD_FIRST_GLYPH_FN, CG_CONTEXT_NEW_FIRST_GLYPH_FN,
+                       "CGContextShowGlyphsAtPoint's declaration"),
+                      (CG_CONTEXT_AT_POINT_OLD, CG_CONTEXT_AT_POINT_NEW,
+                       "CGContextShowGlyphsAtPoint's glyph loop"),
+                      (CG_CONTEXT_AT_POSITIONS_OLD, CG_CONTEXT_AT_POSITIONS_NEW,
+                       "CGContextShowGlyphsAtPositions's glyph loop"),
+                      (CG_CONTEXT_WITH_ADVANCES_OLD, CG_CONTEXT_WITH_ADVANCES_NEW,
+                       "CGContextShowGlyphsWithAdvances's glyph loop"),
+                  ],
+              }
+          
+              for name in edits_per_file:
+                  if not (repo / name).is_file():
+                      fail("{} does not exist".format(repo / name))
+          
+              # core_text's four sites are identical, so they are replaced in one go and
+              # handled separately: the per-marker count below is what proves all four
+              # were really there.
+              for name, edits in edits_per_file.items():
+                  path = repo / name
+                  if name == CORE_TEXT:
+                      continue
+                  text, written = apply_to_file(path, edits)
+                  check(name, text)
+                  if written:
+                      with open(path, "w", encoding="utf-8", newline="\n") as output:
+                          output.write(text)
+                      print("Wrote {}".format(path))
+                  else:
+                      print("{} is unchanged".format(path))
+          
+              # core_text needs a mixed edit (one import line plus four identical sites),
+              # so it is handled explicitly rather than through apply_to_file.
+              path = repo / CORE_TEXT
+              original = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+              if PATCH_MARKER in original:
+                  text = original
+                  written = False
+              else:
+                  text = replace_once(original, CORE_TEXT_OLD_IMPORT, CORE_TEXT_NEW_IMPORT,
+                                      "the ui_font import")
+                  text = replace_once(text, CORE_TEXT_OLD_SITE, CORE_TEXT_NEW_SITE,
+                                      "the font_from_uifont(env, font) sites",
+                                      count=CORE_TEXT_OLD_SITE_COUNT)
+                  written = True
+              check(CORE_TEXT, text)
+              if written:
+                  with open(path, "w", encoding="utf-8", newline="\n") as output:
+                      output.write(text)
+                  print("Wrote {}".format(path))
+              else:
+                  print("{} is unchanged".format(path))
+          
+              print("Patch L (v14): the CJK/Arabic fallback is now reachable from the CoreText "
+                    "text paths (CTLineDraw and the two measurement calls, plus the framesetter "
+                    "size), through the one text-aware lookup in ui_font.rs, and the glyph-id "
+                    "draw entry points report the .notdef runs they cannot repair.")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PATCH_V14_CJK_TEXT_PY
 
-      - name: Check that the patches really landed
+      - name: Check that the patches really landed, including the touch mapping and the
+             CJK/Arabic text fallback
         run: |
           set -eu
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
           # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5), the
           # file-access / texture-upload tracing (E, v6), the filesystem probe / write
           # tracing (F, v7), the path-origin tracing (G, v8), the nil-component stack
-          # trace (H, v9), the `__vsprintf_chk` signature fix (I, v10) and the guest-
-          # filesystem resource read (K, v12).
+          # trace (H, v9), the `__vsprintf_chk` signature fix (I, v10), the guest-
+          # filesystem resource read (K, v12), the shared touch/render geometry (v13) and the
+          # CJK/Arabic text fallback (L, v14).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
@@ -5020,8 +6625,11 @@ jobs:
           # `_FORTIFY_SOURCE` printf all-zero because `__vsprintf_chk` read the wrong
           # argument, or still read the bytes that
           # CFURLCreateDataAndPropertiesFromResource returns through the host filesystem
-          # instead of the emulated one.
-
+          # instead of the emulated one, or still lays out and rasterises a CJK or Arabic
+          # string with a Latin-only face on the CoreText paths, or still maps host touches
+          # through its own copy of the letterbox rectangle instead of the one shared in
+          # src/window/geometry.rs.
+          
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
           exports=$(grep -c "export_c_func!(CFURLCreateDataAndPropertiesFromResource" "$core" || true)
@@ -5030,7 +6638,7 @@ jobs:
             echo "::error::patch A did not apply cleanly (definitions=$definitions, exports=$exports)"
             exit 1
           fi
-
+          
           # Every marker below is a string whose occurrence count in the patched file the
           # corresponding patch script fixes: the ones an edit inserts must appear the
           # stated number of times, and any marker with expected 0 asserts that a form the
@@ -5047,7 +6655,7 @@ jobs:
               exit 1
             fi
           }
-
+          
           bundle=src/frameworks/foundation/ns_bundle.rs
           check_marker "$bundle" "let path_debug = ns_string::to_rust_string(env, path);" 1
           check_marker "$bundle" "let data_path_debug = ns_string::to_rust_string(env, data_path);" 1
@@ -5058,7 +6666,7 @@ jobs:
           check_marker "$bundle" "let directory_debug = ns_string::to_rust_string(env, directory);" 1
           check_marker "$bundle" "let lproj_debug = ns_string::to_rust_string(env, lproj);" 1
           check_marker "$bundle" "(name={:?} extension={:?} directory={:?} lproj={:?})" 1
-
+          
           # Patch C v4 (C1): one bundle-root retry in each pathForResource:ofType:inDirectory:
           # implementation (the + class method and the - instance method), so exactly two,
           # and both must pass nil for *both* lproj and directory - only that reaches the
@@ -5072,22 +6680,22 @@ jobs:
           # `let path = path_for_resource_helper(env, this, name, nil, directory,
           # extension);` and do not match it.
           check_marker "$bundle" "let bundle_root_path = path_for_resource_helper(env, this, name, nil, directory, extension);" 0
-
+          
           posix=src/libc/posix_io.rs
           check_marker "$posix" "let read_fd_path: Option<String> = file.path.clone();" 1
           check_marker "$posix" "let lseek_fd_path: Option<String> = file.path.clone();" 1
           check_marker "$posix" "called on a guest directory" 2
           check_marker "$posix" "returning {} (guest path: {:?})" 1
           check_marker "$posix" "returning -1 (guest path: {:?})" 1
-
+          
           fs=src/fs.rs
           check_marker "$fs" "no path or fd at this layer" 1
-
+          
           echo "== the pre-patch log calls must be gone =="
           python3 - <<'CHECK_OLD_LOGS'
           import pathlib
           import sys
-
+          
           # The exact text patch B replaced. If any of it is still there the patch did
           # not land and a run would upload a core that logs the same useless pointers.
           stale = {
@@ -5117,7 +6725,7 @@ jobs:
           ''',
               ],
           }
-
+          
           problems = []
           for name, texts in stale.items():
               content = pathlib.Path(name).read_text(encoding="utf-8")
@@ -5125,20 +6733,20 @@ jobs:
                   if text in content:
                       problems.append("{}: still contains the pre-patch log call from line {:?}".format(
                           name, text.strip().splitlines()[0]))
-
+          
           for name in stale:
               content = pathlib.Path(name).read_text(encoding="utf-8")
               if content.count("{") != content.count("}"):
                   problems.append("{}: braces are unbalanced ({} '{{' vs {} '}}')".format(
                       name, content.count("{"), content.count("}")))
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
               sys.exit(1)
           print("no pre-patch log call remains and the patched files are brace-balanced")
           CHECK_OLD_LOGS
-
+          
           echo "== patch D (v5): EUC-KR =="
           # Patch D gives the emulator the Korean text encoding the app asks for. Each
           # marker below is a code line patch D inserts, with the count the patch script
@@ -5159,21 +6767,21 @@ jobs:
           check_marker "$cfstring" "Warning: Unhandled CFStringEncoding {:#x}, defaulting to UTF-8" 1
           check_marker "$nsstring" "pub const NSKoreanEUCStringEncoding: NSUInteger = 0x80000940;" 1
           check_marker "$nsstring" "        NSKoreanEUCStringEncoding => encoding_rs::EUC_KR," 1
-
+          
           python3 - <<'CHECK_EUCKR'
           import pathlib
           import sys
-
+          
           # Structural checks that a substring count cannot make: every new arm has to sit
           # inside the function it belongs to, ahead of that function's fallback, and each
           # new definition has to exist exactly once as a whole line, so an indented copy
           # or an extra insertion somewhere else cannot satisfy them.
           problems = []
-
+          
           cf = pathlib.Path("src/frameworks/core_foundation/cf_string.rs").read_text(encoding="utf-8")
           ns = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
-
-
+          
+          
           def expect_lines(text, where, wanted):
               lines = text.splitlines()
               for line, count in wanted:
@@ -5181,8 +6789,8 @@ jobs:
                   if got != count:
                       problems.append("{}: {:?} appears {} time(s) as a line, expected {}".format(
                           where, line.strip()[:70], got, count))
-
-
+          
+          
           def expect_order(text, where, new_code, before, inside):
               base = text.index(inside)
               try:
@@ -5194,8 +6802,8 @@ jobs:
               if not a < b:
                   problems.append("{}: {:?} does not come before {:?}".format(
                       where, new_code[:60], before[:60]))
-
-
+          
+          
           # D1: the two spellings of the encoding, once each.
           expect_lines(cf, "cf_string.rs D1", [
               ("pub const kCFStringEncodingEUC_KR: CFStringEncoding = 0x940;", 1),
@@ -5227,7 +6835,7 @@ jobs:
               if line not in available:
                   problems.append("cf_string.rs D4: {:?} is not in CFStringIsEncodingAvailable".format(
                       line.strip()))
-
+          
           # D5/D6: the constant and the codec, once each, with the codec inside
           # encoding_rs_for - the helper both the decode and the encode path reach for -
           # ahead of that helper's `_ => return None`.
@@ -5251,12 +6859,12 @@ jobs:
           if not any(one == japanese and two == korean for one, two in zip(list_lines, list_lines[1:])):
               problems.append(
                   "ns_string.rs D7: expected NSKoreanEUCStringEncoding right after NSJapaneseEUCStringEncoding")
-
+          
           for name in ("src/frameworks/core_foundation/cf_string.rs", "src/frameworks/foundation/ns_string.rs"):
               content = pathlib.Path(name).read_text(encoding="utf-8")
               if content.count("{") != content.count("}"):
                   problems.append("{}: braces are unbalanced".format(name))
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -5264,7 +6872,7 @@ jobs:
           print("patch D: both EUC-KR spellings, the two conversion arms, the availability "
                 "entry, the NSStringEncoding constant and the encoding_rs codec are all in place")
           CHECK_EUCKR
-
+          
           echo "== patch E (v6): guest file access and texture uploads =="
           # Every marker below is a line patch E inserts, or - for the two markers with an
           # expected count of 0 - a pre-patch line it replaces. The counts are exact, so a
@@ -5289,7 +6897,7 @@ jobs:
           check_marker "$trace" "FS SUMMARY frames={} tex_uploads={} tex_uploads_compressed={} gl_draws={} opens_ok={} opens_err={} reads_ok={} reads_err={}" 1
           check_marker "$trace" "const TRACE_BUDGET: u32 = 2000;" 1
           check_marker "$trace" "const TRACE_SAMPLE: u32 = 100;" 1
-
+          
           check_marker src/lib.rs "mod fs_trace;" 1
           check_marker src/libc/posix_io.rs "crate::fs_trace::note_open(&actual_path_string, res != -1, flags);" 1
           check_marker src/fs.rs "let bytes_read = result.as_ref().ok().map(|bytes| bytes.len());" 1
@@ -5306,28 +6914,28 @@ jobs:
           check_marker src/frameworks/opengles/gles_guest.rs "First glCompressedTexImage2D(" 0
           check_marker src/frameworks/opengles/gles_guest.rs "First glDrawArrays(" 1
           check_marker src/frameworks/opengles/gles_guest.rs "First glDrawElements(" 1
-
+          
           python3 - <<'CHECK_FSTRACE'
           import pathlib
           import sys
-
+          
           # Structural checks a substring count cannot make: each trace call has to sit
           # where it can only observe the emulated result, the moved Fs::read body has to
           # be intact, and the trace module itself has to be incapable of changing
           # emulation (no unsafe, nothing that panics, no I/O of its own).
           problems = []
-
+          
           trace = pathlib.Path("src/fs_trace.rs").read_text(encoding="utf-8")
           posix = pathlib.Path("src/libc/posix_io.rs").read_text(encoding="utf-8")
           fs = pathlib.Path("src/fs.rs").read_text(encoding="utf-8")
           gles = pathlib.Path("src/frameworks/opengles/gles_guest.rs").read_text(encoding="utf-8")
           eagl = pathlib.Path("src/frameworks/opengles/eagl.rs").read_text(encoding="utf-8")
-
+          
           for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
                       "std::process", "std::fs::"):
               if bad in trace:
                   problems.append("src/fs_trace.rs: contains {!r}, which instrumentation must not use".format(bad))
-
+          
           # note_open must sit after the open's result exists and before that result is
           # returned, so it can neither replace nor influence it.
           call = "crate::fs_trace::note_open(&actual_path_string, res != -1, flags);"
@@ -5338,7 +6946,7 @@ jobs:
                   problems.append("src/libc/posix_io.rs: note_open is not between the open and the return of `res`")
           except ValueError as error:
               problems.append("src/libc/posix_io.rs: {}".format(error))
-
+          
           # Fs::read must still be a pass-through wrapper around read_inner, and
           # read_inner must still contain the pre-patch body line by line.
           wrapper = fs[fs.index("pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {"):]
@@ -5353,7 +6961,7 @@ jobs:
                        "        Ok(result)"):
               if line not in inner:
                   problems.append("src/fs.rs: the pre-patch body line {!r} is missing from read_inner".format(line))
-
+          
           # Both draw entry points must be counted.
           arrays = gles[gles.index("fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {"):]
           arrays = arrays[:arrays.index("\n    with_ctx_and_mem")]
@@ -5362,7 +6970,7 @@ jobs:
           elements = gles[gles.index("fn glDrawElements(\n"):]
           if "crate::fs_trace::note_draw();" not in elements:
               problems.append("gles_guest.rs: glDrawElements is not counted")
-
+          
           # The summary has to be inside presentRenderbuffer, next to the frame counter
           # that already exists there.
           present = eagl[eagl.index("- (bool)presentRenderbuffer:(NSUInteger)target {"):]
@@ -5371,14 +6979,14 @@ jobs:
                          "crate::fs_trace::print_summary(n);"):
               if needed not in present:
                   problems.append("eagl.rs: {!r} is not in presentRenderbuffer".format(needed))
-
+          
           for name in ("src/lib.rs", "src/libc/posix_io.rs", "src/fs.rs",
                        "src/frameworks/opengles/gles_guest.rs",
                        "src/frameworks/opengles/eagl.rs", "src/fs_trace.rs"):
               content = pathlib.Path(name).read_text(encoding="utf-8")
               if content.count("{") != content.count("}"):
                   problems.append("{}: braces are unbalanced".format(name))
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -5387,7 +6995,7 @@ jobs:
                 "counters and the periodic summary are in place, and every traced code "
                 "path can only be observed, never changed")
           CHECK_FSTRACE
-
+          
           echo "== patch F (v7): filesystem probe / write tracing =="
           # Every marker below is a line patch F inserts, or - for the markers with a
           # count of 0 - a string that must not appear in a file patch F does not touch.
@@ -5438,7 +7046,7 @@ jobs:
           check_marker "$probe" "const FIRST_SUMMARY_FRAME: u64 = 60;" 1
           check_marker "$probe" "const SUMMARY_PERIOD: u64 = 300;" 1
           check_marker "$probe" "const E7_SUMMARY_PERIOD: u64 = 600;" 1
-
+          
           check_marker src/lib.rs "mod fs_probe;" 1
           check_marker src/libc/posix_io.rs "crate::fs_probe::note_write_open(&actual_path_string, flags, res != -1);" 1
           check_marker src/libc/posix_io.rs "crate::fs_probe::note_open_failure_pc(" 1
@@ -5467,19 +7075,19 @@ jobs:
           check_marker src/frameworks/foundation/ns_bundle.rs "fs_probe" 0
           check_marker src/frameworks/core_foundation/cf_url.rs "fs_probe" 0
           check_marker src/frameworks/core_foundation/cf_string.rs "fs_probe" 0
-
+          
           python3 - <<'CHECK_FSPROBE'
           import pathlib
           import re
           import sys
-
+          
           # Structural checks a substring count cannot make: every trace call has to sit
           # where it can only observe the emulated value, the two pre-patch bodies patch F
           # rewrote into local bindings have to be intact, the module itself has to be
           # incapable of changing emulation, and the summary cadence has to be the union
           # the documentation describes.
           problems = []
-
+          
           probe = pathlib.Path("src/fs_probe.rs").read_text(encoding="utf-8")
           posix = pathlib.Path("src/libc/posix_io.rs").read_text(encoding="utf-8")
           fs = pathlib.Path("src/fs.rs").read_text(encoding="utf-8")
@@ -5487,13 +7095,13 @@ jobs:
           nsstr = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
           eagl = pathlib.Path("src/frameworks/opengles/eagl.rs").read_text(encoding="utf-8")
           env_rs = pathlib.Path("src/environment.rs").read_text(encoding="utf-8")
-
+          
           # The probe module must be a pure logger.
           for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
                       "std::process::", "std::fs::", "Environment", "env."):
               if bad in probe:
                   problems.append("src/fs_probe.rs: contains {!r}, which instrumentation must not use".format(bad))
-
+          
           # F2: both new statements sit after the emulated result exists and before it is
           # returned, and neither assigns to it.
           open_body = posix[posix.index("pub fn open_direct("):]
@@ -5507,7 +7115,7 @@ jobs:
                   problems.append("src/libc/posix_io.rs: {}".format(error))
           if len(re.findall(r"(?m)^\s*res\s*=[^=]", open_body)) != 0:
               problems.append("src/libc/posix_io.rs: patch F introduced an assignment to `res`")
-
+          
           # F3: Fs::write is still the same three-statement body, bound to a Result.
           write_body = fs[fs.index("pub fn write<P: AsRef<GuestPath>>(&mut self, path: P, data: &[u8]) -> Result<(), ()> {"):]
           write_body = write_body[:write_body.index("\n    }")]
@@ -5521,7 +7129,7 @@ jobs:
               problems.append("src/fs.rs: Fs::write still returns early on open failure, so the failure is untraced")
           if not write_body.rstrip().endswith("result"):
               problems.append("src/fs.rs: Fs::write no longer returns the traced Result")
-
+          
           # F4: each probe hook reports the very value the method returns, next to it.
           if "let exists = env.fs.exists(GuestPath::new(&path));\n    crate::fs_probe::note_exists(&path, exists, None);\n    exists\n}" not in fm:
               problems.append("ns_file_manager.rs: fileExistsAtPath: does not return the value it traces")
@@ -5534,7 +7142,7 @@ jobs:
           trace_at = fm.index("crate::fs_probe::note_exists(&path_str, true, Some(is_dir));", write_at)
           if not is_dir_at < write_at < trace_at:
               problems.append("ns_file_manager.rs: the isDirectory trace does not follow the value it reports")
-
+          
           # F5: the warning is inside stringByAppendingPathComponent: and ahead of the call
           # that actually drops the empty component.
           append_impl = nsstr[nsstr.index("- (id)stringByAppendingPathComponent:(id)component {"):]
@@ -5546,7 +7154,7 @@ jobs:
                   problems.append("ns_string.rs: {!r} is not in stringByAppendingPathComponent:".format(needed))
           if not append_impl.index("note_path_component") < append_impl.index("let res = path_algorithms::string_by_appending_path_component"):
               problems.append("ns_string.rs: the path-join warning comes after the path is already built")
-
+          
           # F6: the frame tick is inside presentRenderbuffer and E7's tick is untouched.
           present = eagl[eagl.index("- (bool)presentRenderbuffer:(NSUInteger)target {"):]
           present = present[:present.index("\n    assert!(target == gles11::RENDERBUFFER_OES);")]
@@ -5563,7 +7171,7 @@ jobs:
                          "crate::fs_trace::print_summary(frame);"):
               if needed not in probe:
                   problems.append("src/fs_probe.rs: the summary cadence is missing {!r}".format(needed))
-
+          
           # F7: the final summary sits on both exit paths, after the log line of each.
           main_exit = env_rs.index("Main thread exited normally")
           if env_rs.index("crate::fs_probe::print_final_summary();", main_exit) - main_exit > 400:
@@ -5571,7 +7179,7 @@ jobs:
           host_exit = env_rs.index("Returning to the iOS host library.")
           if env_rs.index("crate::fs_probe::print_final_summary();", host_exit) - host_exit > 400:
               problems.append("src/environment.rs: no final summary near the host stop path")
-
+          
           for name in ("src/lib.rs", "src/libc/posix_io.rs", "src/fs.rs",
                        "src/frameworks/foundation/ns_file_manager.rs",
                        "src/frameworks/foundation/ns_string.rs",
@@ -5580,7 +7188,7 @@ jobs:
               content = pathlib.Path(name).read_text(encoding="utf-8")
               if content.count("{") != content.count("}"):
                   problems.append("{}: braces are unbalanced".format(name))
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -5591,7 +7199,7 @@ jobs:
                 "summary on both exit paths are in place, and every patch F call site can only "
                 "observe, never change, the emulated result")
           CHECK_FSPROBE
-
+          
           echo "== patch G (v8): where the nil path component comes from =="
           # The four new functions, the five line formats, the rate-limit constants and
           # the call site of every one of them. The counts are exact, so a duplicated or
@@ -5647,11 +7255,11 @@ jobs:
           # patch G adds its line beside it and changes nothing patch F inserted. Patch F
           # asserts the same marker above, so this is the pairing stated twice on purpose.
           check_marker src/frameworks/foundation/ns_string.rs "crate::fs_probe::note_path_component(&base_str, component.is_null());" 1
-
+          
           python3 - <<'CHECK_FSORIGIN'
           import pathlib
           import sys
-
+          
           # The checks a substring count cannot make: the origin line has to sit inside
           # the path-join warn branch, after patch F's warning and before the call that
           # drops the component; every defaults trace has to be able to see the value the
@@ -5660,21 +7268,21 @@ jobs:
           # inside patch E's tracing wrapper and read_inner has to be untouched; and the
           # origin module has to be incapable of changing emulation.
           problems = []
-
+          
           origin = pathlib.Path("src/fs_origin.rs").read_text(encoding="utf-8")
           nsstr = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
           nsdata = pathlib.Path("src/frameworks/foundation/ns_data.rs").read_text(encoding="utf-8")
           defaults = pathlib.Path("src/frameworks/foundation/ns_user_defaults.rs").read_text(encoding="utf-8")
           fs = pathlib.Path("src/fs.rs").read_text(encoding="utf-8")
           lib_rs = pathlib.Path("src/lib.rs").read_text(encoding="utf-8")
-
+          
           # G1: the origin module must be a pure logger, and it must not reach into patch
           # F's module.
           for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
                       "std::process::", "std::fs::", "Environment", "env.", "fs_probe"):
               if bad in origin:
                   problems.append("src/fs_origin.rs: contains {!r}, which instrumentation must not use".format(bad))
-
+          
           # G2: the origin line, its position and its two addresses.
           marker_warning = "crate::fs_probe::note_path_component(&base_str, component.is_null());"
           marker_origin = "crate::fs_origin::note_path_component_origin("
@@ -5694,7 +7302,7 @@ jobs:
                   problems.append("src/frameworks/foundation/ns_string.rs: the origin line does not carry the guest PC")
               if "crate::cpu::Cpu::LR" not in body:
                   problems.append("src/frameworks/foundation/ns_string.rs: the origin line does not carry the guest return address")
-
+          
           # G3: the six defaults lookups. Each trace must follow the lookup it reports and
           # precede the nil check, so a key with no value at all is visible.
           for head, selector, lookup in (
@@ -5726,7 +7334,7 @@ jobs:
                   problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not use the guarded key helper".format(selector))
               if "&defaults_value_summary(env," not in body:
                   problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not summarise its result".format(selector))
-
+          
           # G3g: the two helpers. `to_rust_string` is only used behind an NSString class
           # check, because it borrows the string host object directly.
           for needed in ("fn defaults_key_string(env: &mut Environment, key: id) -> String {",
@@ -5742,7 +7350,7 @@ jobs:
           if key_impl.index("class_is_subclass_of") > key_impl.index("to_rust_string"):
               problems.append("src/frameworks/foundation/ns_user_defaults.rs: the key helper converts before it checks "
                               "the class, so a non-string key could reach to_rust_string")
-
+          
           # G4: both arms of every whole-file reader.
           for signature in ("- (id)initWithContentsOfFile:(id)path {",
                             "- (id)initWithContentsOfFile:(id)path encoding:",
@@ -5769,7 +7377,7 @@ jobs:
                   if uses and body.index(some_call) > min(uses):
                       problems.append("src/frameworks/foundation/ns_string.rs: the successful-read trace of {} follows the "
                                       "first use of bytes".format(signature))
-
+          
           data_body = nsdata[nsdata.index("- (id)initWithContentsOfFile:(id)path {"):]
           data_body = data_body[:data_body.index("\n}")]
           for call in ('crate::fs_origin::note_read_file("NSData", &path_str, None);',
@@ -5779,7 +7387,7 @@ jobs:
           if 'crate::fs_origin::note_read_file("NSData", &path_str, None);' in data_body:
               if not data_body.index("let Ok(bytes) = env.fs.read") < data_body.index('crate::fs_origin::note_read_file("NSData", &path_str, None);') < data_body.rindex("release(env, this);"):
                   problems.append("src/frameworks/foundation/ns_data.rs: the failed-read trace is not in the failure arm")
-
+          
           # G5: the watched-file dump is inside patch E's wrapper, after its counter and
           # before the value is returned, and read_inner is byte for byte the old body.
           wrapper = fs[fs.index("pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {"):]
@@ -5805,11 +7413,11 @@ jobs:
                   problems.append("src/fs.rs: read_inner lost the pre-patch line {!r}".format(line))
           if "fs_origin" in inner:
               problems.append("src/fs.rs: patch G touched read_inner")
-
+          
           # G0: the module is declared after the log macro and beside patch F's module.
           if not lib_rs.index("mod log;") < lib_rs.index("mod fs_origin;") < lib_rs.index("mod fs_probe;"):
               problems.append("src/lib.rs: mod fs_origin; is not between mod log; and mod fs_probe;")
-
+          
           for name in ("src/lib.rs", "src/fs.rs", "src/fs_origin.rs",
                        "src/frameworks/foundation/ns_string.rs",
                        "src/frameworks/foundation/ns_data.rs",
@@ -5817,7 +7425,7 @@ jobs:
               content = pathlib.Path(name).read_text(encoding="utf-8")
               if content.count("{") != content.count("}"):
                   problems.append("{}: braces are unbalanced".format(name))
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -5829,7 +7437,7 @@ jobs:
                 "that does not touch patch F's module, and every patch G call site can only observe, never "
                 "change, the emulated result")
           CHECK_FSORIGIN
-
+          
           echo "== patch H (v9): the guest call stack at the nil path component =="
           # The three new functions, the four line formats and the rate-limit constants of
           # patch H, plus the call site of every one of them. The counts are exact, so a
@@ -5863,11 +7471,11 @@ jobs:
           check_marker "$environment" "fn stack_trace_for_thread(&self, tid: usize) {" 1
           check_marker "$environment" '"Attempting to produce stack trace for current thread (#{}):"' 1
           check_marker "$origin" "fs_probe" 0
-
+          
           python3 - <<'CHECK_FSSTACK'
           import pathlib
           import sys
-
+          
           # The checks a substring count cannot make: the stack line has to sit at the
           # shared path-join site, after patch F's warning and patch G's origin line and
           # before the path is built; the frames have to come from the environment's own
@@ -5876,20 +7484,20 @@ jobs:
           # PATHFOUND calls have to sit on the helper's successful returns; and patch G's
           # module must stay unable to change emulation.
           problems = []
-
+          
           origin = pathlib.Path("src/fs_origin.rs").read_text(encoding="utf-8")
           env_rs = pathlib.Path("src/environment.rs").read_text(encoding="utf-8")
           nsstr = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
           defaults = pathlib.Path("src/frameworks/foundation/ns_user_defaults.rs").read_text(encoding="utf-8")
           bundle = pathlib.Path("src/frameworks/foundation/ns_bundle.rs").read_text(encoding="utf-8")
-
+          
           # H2/H3/H4: the module is (still) a pure logger, and it does not reach into
           # patch F's module.
           for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
                       "std::process::", "std::fs::", "Environment", "env.", "fs_probe"):
               if bad in origin:
                   problems.append("src/fs_origin.rs: contains {!r}, which instrumentation must not use".format(bad))
-
+          
           # H2: the stack line sits between patch G's origin line and the call that drops
           # the component, and it is fed from the environment unwinder.
           marker_warning = "crate::fs_probe::note_path_component(&base_str, component.is_null());"
@@ -5907,7 +7515,7 @@ jobs:
                       < append_impl.index(marker_stack) < append_impl.index(marker_build):
                   problems.append("src/frameworks/foundation/ns_string.rs: the stack line is not between patch G's "
                                   "origin line and the call that drops the component")
-
+          
           # H1: the unwinder is the frame-pointer walk the panic backtrace uses, and the
           # panic backtrace itself is untouched.
           unwinder = env_rs[env_rs.index("pub(crate) fn guest_stack_frames(&self, max: usize) -> Vec<u32> {"):]
@@ -5931,7 +7539,7 @@ jobs:
                   problems.append("src/environment.rs: the panic backtrace lost {!r}".format(needed))
           if "guest_stack_frames" in panic_walk:
               problems.append("src/environment.rs: patch H changed the panic backtrace")
-
+          
           # H3: each defaults write describes the value it is about to store.
           for head, selector, value in (
               ("- (())setObject:(id)object forKey:(id)key { // NSString*", "setObject:forKey:", "defaults_value_summary(env, object)"),
@@ -5952,7 +7560,7 @@ jobs:
                   problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not summarise the value".format(selector))
               if "let key_str = defaults_key_string(env, key);" not in body:
                   problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not use the guarded key helper".format(selector))
-
+          
           # H4: every successful return of path_for_resource_helper names the path, and
           # each PATHFOUND call stands in front of the return it reports.
           helper = bundle[bundle.index("fn path_for_resource_helper("):]
@@ -5968,7 +7576,7 @@ jobs:
                   continue
               if helper.index(call) > helper.index(ret):
                   problems.append("src/frameworks/foundation/ns_bundle.rs: {!r} follows its return".format(call))
-
+          
           for name in ("src/environment.rs", "src/fs_origin.rs",
                        "src/frameworks/foundation/ns_string.rs",
                        "src/frameworks/foundation/ns_user_defaults.rs",
@@ -5976,7 +7584,7 @@ jobs:
               content = pathlib.Path(name).read_text(encoding="utf-8")
               if content.count("{") != content.count("}"):
                   problems.append("{}: braces are unbalanced".format(name))
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -5988,7 +7596,7 @@ jobs:
                 "path_for_resource_helper is named; the panic backtrace is untouched; and patch G's "
                 "module stays a pure logger that does not touch patch F's module")
           CHECK_FSSTACK
-
+          
           echo "== patch I (v10): the __vsprintf_chk argument order =="
           # Patch I fixes one signature and its export entry. The counts are exact, and the
           # old six-placeholder export must be gone, or the guest and the emulator still
@@ -6004,19 +7612,19 @@ jobs:
           # The old form carried six placeholders, i.e. the parameter order of
           # __vsnprintf_chk. It must be gone.
           check_marker "$printf_rs" "export_c_func!(__vsprintf_chk(_, _, _, _, _, _))," 0
-
+          
           python3 - <<'CHECK_VSPRINTFCHK'
           import pathlib
           import sys
-
+          
           # The checks a substring count cannot make: the parameters have to be Apple's
           # five, in order, with no `maxlen`; slen == -1 has to take the unbounded path and
           # a real slen the bounded one; the trace has to be rate limited; and the nine
           # other printf-family signatures the audit checked must be untouched.
           problems = []
-
+          
           printf = pathlib.Path("src/libc/stdio/printf.rs").read_text(encoding="utf-8")
-
+          
           head = "fn __vsprintf_chk(\n"
           body = printf[printf.index(head) + len(head):]
           body = body[:body.index("\n}")]
@@ -6043,7 +7651,7 @@ jobs:
               problems.append("src/libc/stdio/printf.rs: a real slen does not delegate to vsnprintf")
           if "maxlen" in body:
               problems.append("src/libc/stdio/printf.rs: __vsprintf_chk still uses the six-argument name maxlen")
-
+          
           # The nine other entries the audit found already correct, and the five-argument
           # entry patch I writes. Nothing else may carry __vsprintf_chk's old shape.
           for entry in ("export_c_func!(__sprintf_chk(_, _, _, _, _)),",
@@ -6057,10 +7665,10 @@ jobs:
                         "export_c_func!(snprintf(_, _, _, _)),"):
               if entry not in printf:
                   problems.append("src/libc/stdio/printf.rs: the audit entry {!r} is missing".format(entry))
-
+          
           if printf.count("{") != printf.count("}"):
               problems.append("src/libc/stdio/printf.rs: braces are unbalanced")
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -6070,7 +7678,7 @@ jobs:
                 "first 20 calls, and its export entry has five placeholders; the nine other "
                 "printf-family signatures the audit checked are unchanged")
           CHECK_VSPRINTFCHK
-
+          
           echo "== patch K (v12): the resource read goes through the guest filesystem =="
           # Patch K fixes a bug, like patches A, C, D and I. It changes one function and
           # only the way it reads: the bytes and the size that
@@ -6101,28 +7709,28 @@ jobs:
           # The export entry and the API itself are patch A's and must survive verbatim.
           check_marker "$core" "export_c_func!(CFURLCreateDataAndPropertiesFromResource(_, _, _, _, _, _))," 1
           check_marker "$core" "fn CFURLCreateDataAndPropertiesFromResource(" 1
-
+          
           python3 - <<'CHECK_CFURL_FS'
           import pathlib
           import sys
-
+          
           # The checks a substring count cannot make: the signature and the out-parameter
           # semantics have to be exactly patch A's, the body must not reach the host
           # filesystem at all, the read has to be what decides the error code in both
           # directions, and the trace has to sit in both arms of the read.
           problems = []
-
+          
           core = pathlib.Path("src/frameworks/core_foundation/cf_url.rs").read_text(encoding="utf-8")
-
+          
           if "std::fs::" in core:
               problems.append("src/frameworks/core_foundation/cf_url.rs: the file still refers to std::fs::")
           if core.count("{") != core.count("}"):
               problems.append("src/frameworks/core_foundation/cf_url.rs: braces are unbalanced")
-
+          
           head = "fn CFURLCreateDataAndPropertiesFromResource(\n"
           body = core[core.index(head) + len(head):]
           body = body[:body.index("\n}\n")]
-
+          
           # 1. The signature is unchanged (patch A's seven parameters, in order), so the
           #    export entry and every caller keep working.
           params = [line.strip().rstrip(",") for line in body.split(") -> bool {")[0].splitlines()]
@@ -6138,7 +7746,7 @@ jobs:
           if params != wanted:
               problems.append("src/frameworks/core_foundation/cf_url.rs: the parameters are {!r}, expected {!r}".format(
                   params, wanted))
-
+          
           # 2. Nothing inside the function reaches the host filesystem, and the guest path,
           #    the size and the bytes all come from env.fs. `std::fs::` (not the bare
           #    `std::fs` the comment mentions) is what a host-filesystem call looks like.
@@ -6152,7 +7760,7 @@ jobs:
                   problems.append("src/frameworks/core_foundation/cf_url.rs: the function is missing {!r}".format(needed))
           if "metadata(" in body or "::read(&path)" in body:
               problems.append("src/frameworks/core_foundation/cf_url.rs: a host-filesystem read survives in the function")
-
+          
           # 3. The read decides the error code in both directions, exactly like patch A.
           ok_arm = body[body.index("Ok(bytes) => {"):]
           ok_arm = ok_arm[:ok_arm.index("Err(_) => {")]
@@ -6164,7 +7772,7 @@ jobs:
               problems.append("src/frameworks/core_foundation/cf_url.rs: a failed guest read no longer returns false")
           if "env.mem.write(error_code, K_CF_URL_SUCCESS);" not in body:
               problems.append("src/frameworks/core_foundation/cf_url.rs: the success error code is gone")
-
+          
           # 4. The bytes still become a CFData through the same constructor and the same
           #    out parameter; the size still reaches the properties dictionary under the
           #    same key.
@@ -6175,7 +7783,7 @@ jobs:
                          "env.mem.write(properties, dict);"):
               if needed not in body:
                   problems.append("src/frameworks/core_foundation/cf_url.rs: {!r} is gone".format(needed))
-
+          
           # 5. The trace: one nested rate-limited helper, the required format string, both
           #    arms calling it with the length they know, and the ok arm logging before it
           #    builds the CFData. Both lines are normal-level `log!` calls, because
@@ -6212,7 +7820,7 @@ jobs:
           if err_arm.index("note_cfurldata(url, &path, file_len.unwrap_or(0) as usize, false);") \
                   > err_arm.index("return false;"):
               problems.append("src/frameworks/core_foundation/cf_url.rs: the failed arm logs after returning")
-
+          
           if problems:
               for problem in problems:
                   print("::error::" + problem)
@@ -6223,6 +7831,350 @@ jobs:
                 " normal-level 'CFURLDATA url=... path=... len=... ok=...' line in both arms of the read"
                 " (log!, not the log_dbg! that log::ENABLED_MODULES suppresses on device)")
           CHECK_CFURL_FS
+          
+          echo "== patch L (v14): the CJK/Arabic fallback reaches the CoreText paths =="
+          # Patch L makes the existing CJK/Arabic fallback reachable from the CoreText text
+          # paths, which used to build their Font straight from a UIFont's kind and so
+          # rasterised every Chinese/Japanese/Korean character with Liberation Sans - one
+          # empty box per character. There is still exactly one implementation of the
+          # classification, in src/frameworks/uikit/ui_font.rs; the CoreText call sites go
+          # through it with the text in hand. The glyph-id drawing entry points cannot do
+          # that (a glyph id carries no character) and are deliberately left alone.
+          ui_font=src/frameworks/uikit/ui_font.rs
+          core_text=src/frameworks/core_text.rs
+          cg_context=src/frameworks/core_graphics/cg_context.rs
+          frameworks=src/frameworks.rs
+          uikit=src/frameworks/uikit.rs
+          
+          # One shared lookup, one classification, and the trace that names it.
+          check_marker "$ui_font" "pub(crate) fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {" 1
+          check_marker "$ui_font" "pub(crate) enum FontKind {" 1
+          check_marker "$ui_font" "pub(crate) struct State {" 1
+          check_marker "$ui_font" "pub(crate) fn font_kind_from_uifont(" 1
+          check_marker "$ui_font" "fn font_kind_is_bold(kind: FontKind) -> bool {" 1
+          check_marker "$ui_font" "fn is_cjk_char(c: u32) -> bool {" 1
+          check_marker "$ui_font" "fn is_arabic_char(c: u32) -> bool {" 1
+          # The pre-patch forms must be gone: a `pub(super)` type is not reachable from
+          # core_text, and a private fn cannot be shared with it.
+          check_marker "$ui_font" "pub(super) enum FontKind {" 0
+          check_marker "$ui_font" "pub(super) struct State {" 0
+          check_marker "$ui_font" "\nfn get_font<'a>(state: &'a mut State" 0
+          # The trace: normal-level log! (log_dbg! is suppressed on device), rate limited
+          # to the first 20 substitutions, with the format the task asks for.
+          check_marker "$ui_font" '"CJKFONT requested={:?} -> NotoSansSC ({} CJK chars)",' 1
+          check_marker "$ui_font" "if CJKFONT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {" 1
+          check_marker "$ui_font" "static CJKFONT_LOGGED: std::sync::atomic::AtomicUsize =" 1
+          check_marker "$ui_font" "note_cjk_font(kind, cjk_chars);" 1
+          check_marker "$ui_font" "let is_bold = font_kind_is_bold(kind);" 1
+          # The five metric getters (-capHeight, -xHeight, -ascender, -descender,
+          # -leading) take no text, so they keep using get_font_by_kind directly: one
+          # definition, five call sites. If one of them is ever wired to get_font, the
+          # count changes and the build fails.
+          check_marker "$ui_font" "get_font_by_kind(" 7
+          
+          # The state accessor the CoreText/CoreGraphics paths use, and the field that
+          # makes it reachable outside the UIKit module.
+          check_marker "$frameworks" "pub(crate) uikit: uikit::State," 1
+          check_marker "$uikit" "pub(crate) fn font_for_text(" 1
+          check_marker "$uikit" "ui_font::get_font(&mut self.ui_font, kind, text)" 1
+          
+          # The four text-aware call sites in core_text (it has the text, so it can pick
+          # the fallback face). The glyph-id producers keep their old behaviour on
+          # purpose.
+          check_marker "$core_text" "env.framework_state.uikit.font_for_text(font_kind, &text_str);" 4
+          check_marker "$core_text" "let font_kind = font_kind_from_uifont(env, font).unwrap_or(FontKind::SansRegular);" 4
+          check_marker "$core_text" "let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);" 0
+          check_marker "$core_text" "let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);" 1
+          
+          # The glyph-id entry points: the rate-limited .notdef report, in all three.
+          check_marker "$cg_context" "fn note_notdef_glyphs(glyph_ids: &[rusttype::GlyphId], entry: &str) {" 1
+          check_marker "$cg_context" 'note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPoint");' 1
+          check_marker "$cg_context" 'note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPositions");' 1
+          check_marker "$cg_context" 'note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsWithAdvances");' 1
+          check_marker "$cg_context" "if CJKNODEF_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {" 1
+          
+          python3 - <<'CHECK_CJK_TEXT'
+          import pathlib
+          import sys
+          
+          # The checks a substring count cannot make: that the CoreText sites that now
+          # consult the text really are the four that have it, that the glyph-id producers
+          # were left alone on purpose, that the classification was not copied, and that
+          # the glyph-id drawing entry points and the empty text stubs are untouched.
+          problems = []
+          
+          ui_font = pathlib.Path("src/frameworks/uikit/ui_font.rs").read_text(encoding="utf-8")
+          core_text = pathlib.Path("src/frameworks/core_text.rs").read_text(encoding="utf-8")
+          cg_context = pathlib.Path("src/frameworks/core_graphics/cg_context.rs").read_text(encoding="utf-8")
+          uikit = pathlib.Path("src/frameworks/uikit.rs").read_text(encoding="utf-8")
+          frameworks = pathlib.Path("src/frameworks.rs").read_text(encoding="utf-8")
+          
+          for name, text in (("src/frameworks/uikit/ui_font.rs", ui_font),
+                             ("src/frameworks/core_text.rs", core_text),
+                             ("src/frameworks/core_graphics/cg_context.rs", cg_context),
+                             ("src/frameworks/uikit.rs", uikit),
+                             ("src/frameworks.rs", frameworks)):
+              if text.count("{") != text.count("}"):
+                  problems.append("{}: braces are unbalanced ({} vs {})".format(
+                      name, text.count("{"), text.count("}")))
+          
+          
+          def body_of(text, header, target):
+              """The body of the function whose signature line is `header`.
+          
+              Works whether or not the header already contains the opening brace: the body
+              starts after the `{` that ends the signature and stops at the closing brace
+              in column 0. Rust function signatures here never contain a brace followed by
+              a newline, so the first `{\\n` after the header is the function's own.
+              """
+              if text.count(header) != 1:
+                  problems.append("{}: {!r} appears {} time(s), expected 1".format(
+                      target, header, text.count(header)))
+                  return ""
+              brace = text.find("{\n", text.index(header))
+              if brace == -1:
+                  problems.append("{}: could not find the opening brace of {}".format(target, header))
+                  return ""
+              end = text.find("\n}\n", brace)
+              if end == -1:
+                  problems.append("{}: could not find the end of {}".format(target, header))
+                  return ""
+              return text[brace + 1:end]
+          
+          
+          # 1. Exactly one implementation of the classification in the whole crate: the
+          #    helpers must be defined in ui_font.rs and nowhere else, and core_text must
+          #    not carry a second copy.
+          if "fn is_cjk_char(" not in ui_font or "fn is_arabic_char(" not in ui_font:
+              problems.append("src/frameworks/uikit/ui_font.rs: the script classification is gone")
+          for text, name in ((core_text, "src/frameworks/core_text.rs"),
+                             (cg_context, "src/frameworks/core_graphics/cg_context.rs")):
+              if "fn is_cjk_char(" in text or "fn is_arabic_char(" in text:
+                  problems.append("{}: a second copy of the script classification was added".format(name))
+              if "is_cjk_char(" in text or "is_arabic_char(" in text:
+                  problems.append("{}: reaches into the classification instead of using get_font".format(name))
+          
+          # 2. get_font keeps its structure: CJK first (with the trace before the return),
+          #    Arabic second, the kind lookup last.
+          get_font = body_of(
+              ui_font,
+              "pub(crate) fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {",
+              "src/frameworks/uikit/ui_font.rs")
+          if get_font:
+              for needed in ("if is_cjk_char(c) {",
+                             "} else if is_arabic_char(c) {",
+                             "let is_bold = font_kind_is_bold(kind);",
+                             "note_cjk_font(kind, cjk_chars);",
+                             "return state.sans_bold_zh.get_or_insert_with(Font::sans_bold_zh);",
+                             "return state.sans_regular_zh.get_or_insert_with(Font::sans_regular_zh);",
+                             "return state.sans_bold_ar.get_or_insert_with(Font::sans_bold_ar);",
+                             "return state.sans_regular_ar.get_or_insert_with(Font::sans_regular_ar);",
+                             "state.get_font_by_kind(kind)"):
+                  if needed not in get_font:
+                      problems.append("src/frameworks/uikit/ui_font.rs: get_font lost {!r}".format(needed))
+              if get_font.index("if cjk_chars > 0 {") > get_font.index("if needs_arabic {"):
+                  problems.append("src/frameworks/uikit/ui_font.rs: the CJK priority over Arabic is gone")
+              if get_font.index("note_cjk_font(kind, cjk_chars);") > get_font.index("sans_bold_zh.get_or_insert_with"):
+                  problems.append("src/frameworks/uikit/ui_font.rs: the trace does not run before the fallback")
+          
+          # 3. The four core_text sites that have the text: each inside the function that
+          #    owns that text, and each still measuring/drawing with the object it got.
+          SITES = {
+              "fn CTLineGetTypographicBounds(": "let width = font_obj.calculate_text_size(size, &text_str, None).0;",
+              "fn CTLineGetImageBounds(": "let (w, h) = font_obj.calculate_text_size(size, &text_str, None);",
+              "fn CTLineDraw(": "font_obj.draw(size, &text_str,",
+              "fn CTFramesetterSuggestFrameSizeWithConstraints(": "let (w, h) = font_obj.calculate_text_size(size, &text_str, wrap);",
+          }
+          for header, consumer in SITES.items():
+              body = body_of(core_text, header, "src/frameworks/core_text.rs")
+              if not body:
+                  continue
+              for needed in ("let text_str = to_rust_string(env, text).into_owned();",
+                             "let font_kind = font_kind_from_uifont(env, font).unwrap_or(FontKind::SansRegular);",
+                             "let font_obj = env.framework_state.uikit.font_for_text(font_kind, &text_str);",
+                             consumer):
+                  if needed not in body:
+                      problems.append("src/frameworks/core_text.rs: {} is missing {!r}".format(header, needed))
+              # The text must be resolved before the font is chosen, never after.
+              if body.index("let text_str") > body.index("font_for_text(font_kind, &text_str)"):
+                  problems.append("src/frameworks/core_text.rs: {} picks the font before it has the text".format(header))
+          if core_text.count("font_for_text(font_kind, &text_str)") != 4:
+              problems.append("src/frameworks/core_text.rs: font_for_text is called {} time(s), expected 4".format(
+                  core_text.count("font_for_text(font_kind, &text_str)")))
+          
+          # 4. The glyph-id producer is deliberately unchanged: its ids must stay in the
+          #    namespace of the font object that produced them, or the run that draws them
+          #    renders the wrong glyphs rather than none.
+          glyphs_for_chars = body_of(core_text, "fn CTFontGetGlyphsForCharacters(", "src/frameworks/core_text.rs")
+          if glyphs_for_chars:
+              if "let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);" not in glyphs_for_chars:
+                  problems.append("src/frameworks/core_text.rs: CTFontGetGlyphsForCharacters no longer maps"
+                                  " through its own font object")
+              if "font_for_text" in glyphs_for_chars:
+                  problems.append("src/frameworks/core_text.rs: CTFontGetGlyphsForCharacters now selects a"
+                                  " fallback font for ids the drawing font cannot interpret")
+          
+          # 5. The glyph-id drawing entry points draw with the context font and the ids they
+          #    were handed; the report is the only thing added, and it must not alter the
+          #    glyph run or the font.
+          for header in ("fn CGContextShowGlyphsAtPoint(", "fn CGContextShowGlyphsAtPositions(",
+                         "fn CGContextShowGlyphsWithAdvances("):
+              body = body_of(cg_context, header, "src/frameworks/core_graphics/cg_context.rs")
+              if not body:
+                  continue
+              if "note_notdef_glyphs(&glyph_ids," not in body:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: {} has no .notdef report".format(header))
+              if "font_for_text" in body or "font_kind_from_uifont" in body:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: {} tries to choose a fallback"
+                                  " font from glyph ids".format(header))
+              if "rusttype_font.draw_glyphs" not in body and "rusttype_font.draw_glyphs_at_positions" not in body \
+                      and "rusttype_font.draw_glyphs_with_advances" not in body:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: {} no longer draws the run".format(header))
+          
+          # 6. The text entry points that are stubs in this tree must stay stubs: they draw
+          #    nothing, so there is no font choice to make, and implementing them would be a
+          #    new feature rather than a fix.
+          STUBS = {
+              "fn CGContextShowTextAtPoint(": ("_x: CGFloat,", "_y: CGFloat,", "_string: crate::mem::ConstPtr<u8>,", "_length: u32,"),
+              "fn CGContextShowText(": ("_string: crate::mem::ConstPtr<u8>,", "_length: u32,"),
+              "fn CGContextSelectFont(": ("_name: crate::mem::ConstPtr<u8>,", "_size: CGFloat,", "_encoding: i32,"),
+          }
+          for header, ignored_params in STUBS.items():
+              body = body_of(cg_context, header, "src/frameworks/core_graphics/cg_context.rs")
+              if not body:
+                  continue
+              if body.strip() != "":
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: {} is no longer an empty stub"
+                                  " (it gained a body: {!r})".format(header, body.strip()[:60]))
+              signature = cg_context[cg_context.index(header):]
+              signature = signature[:signature.index("{\n")]
+              for param in ignored_params:
+                  if param not in signature:
+                      problems.append("src/frameworks/core_graphics/cg_context.rs: {} lost the parameter {!r}".format(
+                          header, param))
+          
+          # 7. CGContextSetFont has no text, so its font lookup must stay what it was (a
+          #    UIFont converted by font_from_uifont, or Liberation Sans for an unknown
+          #    object) - no script-based choice may creep in there.
+          set_font = body_of(cg_context, "fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {",
+                             "src/frameworks/core_graphics/cg_context.rs")
+          if set_font:
+              if "font_for_text" in set_font or "font_kind_from_uifont" in set_font:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: CGContextSetFont tries to choose a"
+                                  " fallback font, but the text is not known when a font is selected")
+              if "uikit::ui_font::font_from_uifont(env, font)" not in set_font:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: CGContextSetFont lost its UIFont"
+                                  " conversion")
+          
+          # 8. The five UIFont metric getters have no text and must keep using the kind.
+          METRIC_GETTERS = ("- (CGFloat)capHeight {", "- (CGFloat)xHeight {", "- (CGFloat)ascender {",
+                            "- (CGFloat)descender {", "- (CGFloat)leading {")
+          for header in METRIC_GETTERS:
+              if ui_font.count(header) != 1:
+                  problems.append("src/frameworks/uikit/ui_font.rs: {!r} appears {} time(s)".format(
+                      header, ui_font.count(header)))
+                  continue
+              body = ui_font[ui_font.index(header):]
+              body = body[:body.index("\n}\n")]
+              if "get_font_by_kind(" not in body:
+                  problems.append("src/frameworks/uikit/ui_font.rs: {} no longer uses the kind-based lookup".format(header))
+              if "font_for_text" in body:
+                  problems.append("src/frameworks/uikit/ui_font.rs: {} has no text, so it must not use the"
+                                  " text-aware lookup".format(header))
+          
+          # 9. font_from_uifont itself is unchanged: it still reconstructs the face from the
+          #    kind, which is what the glyph-id producers and CGContextSetFont rely on.
+          if "pub fn font_from_uifont(env: &mut Environment, obj: crate::objc::id) -> Option<Font> {" not in ui_font:
+              problems.append("src/frameworks/uikit/ui_font.rs: font_from_uifont's signature changed")
+          for arm in ("FontKind::MonoRegular => Font::mono_regular(),",
+                      "FontKind::SerifItalic => Font::serif_italic(),"):
+              if arm not in ui_font:
+                  problems.append("src/frameworks/uikit/ui_font.rs: font_from_uifont lost the arm {!r}".format(arm))
+          
+          # 10. The trace has to be a normal-level log: log::ENABLED_MODULES is empty in
+          #     device builds, so a debug-level line would never reach a device log.
+          note = body_of(ui_font, "fn note_cjk_font(kind: FontKind, cjk_chars: usize) {",
+                         "src/frameworks/uikit/ui_font.rs")
+          if note:
+              if "log_dbg" in note:
+                  problems.append("src/frameworks/uikit/ui_font.rs: the CJK trace uses log_dbg!, which"
+                                  " log::ENABLED_MODULES suppresses on device")
+              if 'log!(\n        "CJKFONT requested={:?} -> NotoSansSC ({} CJK chars)",' not in note:
+                  problems.append("src/frameworks/uikit/ui_font.rs: the CJK trace does not use log!")
+              if "if CJKFONT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {" not in note:
+                  problems.append("src/frameworks/uikit/ui_font.rs: the CJK trace is not rate limited to 20")
+          
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch L: the CJK/Arabic fallback now reaches the CoreText text paths (CTLineDraw, the two"
+                " line-measurement calls and the framesetter size) through the single text-aware lookup in"
+                " ui_font.rs - core_text carries no second copy of the classification - while the glyph-id"
+                " producers, the glyph-id drawing entry points, CGContextSetFont, the empty CGContextShowText*"
+                " stubs and the five text-free UIFont metric getters keep their behaviour, and the first 20"
+                " substitutions log a normal-level 'CJKFONT requested=... -> NotoSansSC (N CJK chars)' line")
+          CHECK_CJK_TEXT
+          
+          echo "== v13: the touch path and the render path share one geometry =="
+          [ -s src/window/geometry.rs ] || { echo "::error::src/window/geometry.rs is missing"; exit 1; }
+          for needle in \
+            "pub(super) fn fit_viewport(" \
+            "pub(super) fn window_to_drawable(" \
+            "pub(super) fn gl_to_top_down_viewport(" \
+            "pub(super) fn normalize_viewport_coords(" \
+            "pub(super) fn should_log_touch_trace(" \
+            "fn input_is_the_exact_inverse_of_the_presentation()" \
+            "fn fit_viewport_matches_the_measured_dnf_geometry()" \
+            "fn the_letterbox_does_not_depend_on_the_scale_hack()" \
+            "fn touch_trace_is_throttled()"
+          do
+            grep -qF "$needle" src/window/geometry.rs || { echo "::error::src/window/geometry.rs lacks: $needle"; exit 1; }
+          done
+          for needle in \
+            "mod geometry;" \
+            "pub fn viewport_for_input(&self)" \
+            "pub fn touch_guest_size(&self)" \
+            "pub fn guest_screen_size(&self)" \
+            "geometry::fit_viewport(self.guest_screen_size(), self.window.drawable_size())" \
+            "window.viewport_for_input()" \
+            "geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh))" \
+            "let (out_w, out_h) = window.touch_guest_size();" \
+            "trace_touch_map: bool," \
+            "trace_touch_map: options.trace_touch_map," \
+            "window.trace_touch_map" \
+            "geometry::should_log_touch_trace(n)" \
+            "TOUCHHLE_TRACE_TOUCH_MAP: #"
+          do
+            grep -qF "$needle" src/window.rs || { echo "::error::src/window.rs lacks: $needle"; exit 1; }
+          done
+          [ "$(grep -cF 'geometry::window_to_drawable(' src/window.rs)" = "5" ] || { echo "::error::expected 5 window_to_drawable() call sites"; exit 1; }
+          for needle in "pub trace_touch_map: bool," "trace_touch_map: false," 'arg == "--trace-touch-map"'; do
+            grep -qF "$needle" src/options.rs || { echo "::error::src/options.rs lacks: $needle"; exit 1; }
+          done
+          grep -qF -- "--trace-touch-map" OPTIONS_HELP.txt || { echo "::error::OPTIONS_HELP.txt does not document --trace-touch-map"; exit 1; }
+          grep -qF "mod geometry;" src/window.rs
+          echo "v13 touch/render geometry: present"
+          
+          echo "== v15: both new patches are applied in this tree =="
+          # The two patches have no file in common. v13 (the shared touch/render geometry)
+          # owns src/window.rs, src/window/geometry.rs, src/options.rs and
+          # OPTIONS_HELP.txt; v14 (the CJK/Arabic text fallback) owns
+          # src/frameworks.rs, src/frameworks/uikit.rs, src/frameworks/uikit/ui_font.rs,
+          # src/frameworks/core_text.rs and src/frameworks/core_graphics/cg_context.rs.
+          # A tree with only one of them is not a v15 tree and must not reach the upload
+          # step, so the three landmarks below are asserted together here as well.
+          [ -s src/window/geometry.rs ] || { echo "::error::v13 is missing: src/window/geometry.rs is absent or empty"; exit 1; }
+          grep -qF "mod geometry;" src/window.rs || { echo "::error::v13 is missing: src/window.rs does not declare src/window/geometry.rs"; exit 1; }
+          grep -qF -- "--trace-touch-map" src/options.rs || { echo "::error::v13 is missing: --trace-touch-map is not in src/options.rs"; exit 1; }
+          grep -qF "pub(crate) fn font_for_text(" src/frameworks/uikit.rs || { echo "::error::v14 is missing: src/frameworks/uikit.rs has no font_for_text"; exit 1; }
+          font_for_text=$(grep -c -F "env.framework_state.uikit.font_for_text(font_kind, &text_str);" src/frameworks/core_text.rs || true)
+          echo "  src/frameworks/core_text.rs: font_for_text call sites x$font_for_text (expected 4)"
+          if [ "$font_for_text" != "4" ]; then
+            echo "::error::v14 is missing: src/frameworks/core_text.rs has $font_for_text font_for_text call site(s), expected 4"
+            exit 1
+          fi
+          echo "v15: the touch/render geometry (v13) and the CJK/Arabic text fallback (v14) are both in place"
 
       - name: Build the shared SDL2 the core links against
         run: |
@@ -6299,6 +8251,21 @@ jobs:
 
           echo "== code signature check (informational) =="
           codesign -dv "$dylib" 2>&1 | head -5 || true
+          
+          echo "== v13: the shared touch/render geometry is compiled in =="
+          touchmap=$(strings "$dylib" | grep -c "TOUCHHLE_TRACE_TOUCH_MAP: #" || true)
+          echo "touch-mapping trace marker occurrences: $touchmap"
+          if [ "$touchmap" -lt 1 ]; then
+            echo "::error::the v13 touch-mapping trace is not in the dylib"
+            exit 1
+          fi
+          traceopt=$(strings "$dylib" | grep -c -- "--trace-touch-map" || true)
+          echo "--trace-touch-map occurrences: $traceopt"
+          if [ "$traceopt" -lt 1 ]; then
+            echo "::error::the --trace-touch-map option is not in the dylib"
+            exit 1
+          fi
+          
 
       - name: Collect the dylib and its sha256
         run: |
@@ -6312,7 +8279,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v12
+          name: hyperhle-core-ios-arm64-v15
           path: dist/*
           if-no-files-found: error
           retention-days: 30
