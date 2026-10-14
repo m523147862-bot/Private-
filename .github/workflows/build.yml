@@ -24,12 +24,26 @@
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v6 variant of build-core.yml (v1). v2 added the logging; v3 added
+# Builds the iOS emulator core (libhyperhle_core.dylib) for Applesauce on a
+# GitHub-hosted macOS machine, so the core can be built without owning a Mac.
+#
+# How to use it: put this file in a repository as .github/workflows/build.yml,
+# then open the Actions tab, pick "Build iOS emulator core (dylib)" and press
+# "Run workflow". A run takes about 20-40 minutes; the finished dylib is in the
+# Artifacts section at the bottom of the run page.
+#
+# Nothing needs to be forked. The job checks out the upstream Applesauce
+# repository at a fixed commit on the runner itself, applies six patches,
+# builds the core, verifies the result and uploads it. This file is the only
+# file the account running it needs.
+#
+# This is the v7 variant of build-core.yml (v1). v2 added the logging; v3 added
 # the first patch that fixes a bug instead of instrumenting one; v4 corrected
 # that patch and added two fields to the log it was hidden behind; v5 makes the
-# emulator decode EUC-KR, the encoding the app asks for; v6 adds the
-# file-access and texture-upload tracing that explains a black screen (it is
-# instrumentation only, like v2's):
+# emulator decode EUC-KR, the encoding the app asks for; v6 added the
+# file-access and texture-upload tracing; v7 adds the tracing of the
+# filesystem calls that never open a file, because the v6 device log showed a
+# path that is opened 30 times and is never a file:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -58,20 +72,35 @@
 #     decodes it with encoding_rs::EUC_KR, which is already a dependency of the
 #     crate; it leaves the unsupported-encoding fallback in place for every
 #     other encoding.
-#   patch E (new in v6) is instrumentation, like patch B. The v5 core starts the
-#     game, runs its render loop at 60 FPS and still shows an almost black
-#     screen, and the v5 log can only offer the *first* texture upload of the
-#     run (a 1x1 placeholder, which is what a failed image load leaves behind).
-#     Patch E traces what the app really does: every guest open()/fopen()/
-#     NSFileHandle call (one hook in posix_io::open_direct) and every "read this
-#     whole file" call (one hook in Fs::read, which NSData, UIImage and
-#     CGDataProvider all go through), every glTexImage2D and
-#     glCompressedTexImage2D upload with its size, a count of glDrawArrays/
-#     glDrawElements, and one cumulative "FS SUMMARY" line every 600 guest
-#     frames. No pixel data is ever logged and no return value or branch is
-#     touched; the rate limit and the counters live in the new src/fs_trace.rs.
-# The artifact is named hyperhle-core-ios-arm64-v6 so it cannot be mistaken for
-# the v1..v5 dylibs.
+#   patch E (v6) is instrumentation, like patch B. The v5 core starts the game,
+#     runs its render loop at 60 FPS and still shows an almost black screen, and
+#     the v5 log could only offer the *first* texture upload of the run (a 1x1
+#     placeholder, which is what a failed image load leaves behind). Patch E
+#     traces every guest open()/fopen()/NSFileHandle call (one hook in
+#     posix_io::open_direct) and every "read this whole file" call (one hook in
+#     Fs::read), every glTexImage2D and glCompressedTexImage2D upload with its
+#     size, a count of glDrawArrays/glDrawElements, and one cumulative
+#     "FS SUMMARY" line every 600 guest frames.
+#   patch F (new in v7) is instrumentation too, and it follows up what the v6
+#     log found: only nine files were read at all (none of them a game
+#     resource), and all 30 "FSOPEN ok" lines point at the same *directory*,
+#     <App>/Documents, retried about once every ten frames. Patch E could not
+#     see why, because the path is built and probed in calls that never open
+#     anything. Patch F adds: a "PATHJOIN WARNING" line whenever
+#     -[NSString stringByAppendingPathComponent:] gets a nil or empty component
+#     (that is exactly how ".../Documents" + "" stays ".../Documents", i.e. how
+#     a file name is lost), "FSEXIST"/"FSLIST"/"FSATTR"/"FSREADABLE"/
+#     "FSWRITABLE" lines for the NSFileManager probe calls, "FSWRITE" for every
+#     open() that asks to write or create and "FSCREATE" for every "write this
+#     whole file" call (NSData writeToFile:, NSFileManager createFileAtPath:,
+#     NSString writeToFile:, ...), the guest PC of a failed open, and a summary
+#     at frame 60 and every 300 frames plus a final one on exit (a device run is
+#     only a few hundred frames long, so patch E's 600-frame line never fired
+#     there). No return value and no branch of the emulated call is touched; the
+#     rate limit, the counters and the summary cadence live in the new
+#     src/fs_probe.rs.
+# The artifact is named hyperhle-core-ios-arm64-v7 so it cannot be mistaken for
+# the v1..v6 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -157,7 +186,8 @@ jobs:
           echo "python: $(python3 --version)"
 
       - name: Patch in the missing CoreFoundation API, the logging instrumentation,
-             the bundle-root fallback, the EUC-KR decoding and the file/texture tracing
+             the bundle-root fallback, the EUC-KR decoding, the file/texture tracing
+             and the filesystem probe/write tracing
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -1781,18 +1811,1011 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_E_PY
+          python3 - <<'PATCH_F_PY'
+          #!/usr/bin/env python3
+          """Filesystem probe / write tracing (patch F, v7) for the Applesauce iOS core.
+
+          Counterpart of patch_cf_url.py (patch A), patch_logging_v2.py (patch B),
+          patch_ns_bundle_root_fallback_v4.py (patch C), patch_euckr_v5.py (patch D) and
+          patch_fsinstrument_v6.py (patch E). Like patch B and patch E this one is
+          instrumentation only: it adds no API, no fallback and no behaviour change. Every
+          edit below either inserts a `log!`-only statement or moves an existing
+          expression into a local binding so the trace can observe the very value that is
+          returned; nothing here changes a return value, a condition or a control-flow
+          edge, and patch F does not edit a single line that patches A-E inserted.
+
+          What it is for
+          --------------
+          The v6 device log answered most of "why is the screen black" but left one gap
+          and one unexplained pattern:
+
+          * Only nine files were read at all and none of them was a game resource
+            (`.pak`, `.act`, `.Tx`, `.dat`, UI `.png`); the only two game files touched
+            were `b1_Title.mp3` and `Library/Preferences/com.nexonmobile.dnfswordman.plist`.
+            Eleven textures were uploaded: ten 1x1 placeholders and one 512x32 font
+            atlas.
+          * All 30 `FSOPEN ok` lines point at the same path, `<App>/Documents` - a
+            *directory* - evenly spread over the whole log (roughly one every ten
+            frames). The app retries the same open forever and never asks for a real
+            file.
+
+          Patch E could not see either the place where such a path is *assembled* or the
+          calls that *probe* a path without opening it, and those are exactly where a file
+          name gets lost:
+
+          1. `-[NSString stringByAppendingPathComponent:]` returns the receiver unchanged
+             when the component is nil or empty - `path_algorithms::string_by_appending_path_component`
+             drops empty components - so `".../Documents"` + `""` is exactly
+             `".../Documents"`, the path the 30 opens use.
+          2. `-[NSFileManager fileExistsAtPath:]`, `attributesOfItemAtPath:error:`,
+             `contentsOfDirectoryAtPath:error:` and the readability/writability checks
+             never open anything. A name can be built, probed, found missing and dropped
+             without patch E recording one event.
+          3. A create/write path that fails (the "the game tries to write a save or
+             marker file into Documents and retries every ten frames" hypothesis) leaves
+             no trace at all: `Fs::write` is a different entry point from the libc
+             `open()` that patch E hooks.
+
+          Patch F closes those gaps with text-only traces, in the same style as B and E:
+
+            F1  `src/fs_probe.rs` (new file): all the counters, the rate-limit policy and
+                the line formats, so every call site is a single added statement.
+            F2  `src/libc/posix_io.rs`, `open_direct`: after patch E's `note_open`, log
+                the guest PC of a failed open (`FSOPEN ERR-PC ... pc=0x...`) and log every
+                write-intent open (`FSWRITE <path> flags=0x... ok=...`).
+            F3  `src/fs.rs`, `Fs::write`: the pre-patch `?`-chain is bound to a `Result`
+                local (same statements, same value) and traced (`FSCREATE <path> ok=...`).
+                This is the one entry point shared by `-[NSData writeToFile:atomically:]`,
+                `-[NSFileManager createFileAtPath:contents:attributes:]`,
+                `-[NSString writeToFile:...]`, `NSArray`/`NSDictionary writeToFile:`,
+                `NSKeyedArchiver` and `NSUserDefaults`.
+            F4  `src/frameworks/foundation/ns_file_manager.rs`: `FSEXIST`, `FSLIST`,
+                `FSATTR`, `FSREADABLE`, `FSWRITABLE` for the probe calls.
+            F5  `src/frameworks/foundation/ns_string.rs`,
+                `-[NSString stringByAppendingPathComponent:]`: the `PATHJOIN WARNING`
+                line, printed when the component is nil or empty.
+            F6  `src/frameworks/opengles/eagl.rs`, `-[EAGLContext presentRenderbuffer:]`:
+                one added `crate::fs_probe::note_frame(n);` beside patch E's periodic
+                summary, so the counters print at frame 60 and every 300 frames instead
+                of only every 600 (a device run is only a few hundred frames long, so
+                patch E's 600-frame line never fired there).
+            F7  `src/environment.rs`: one `crate::fs_probe::print_final_summary();` on the
+                normal main-thread exit and one on the iOS "host asked us to stop" path,
+                for a final cumulative snapshot.
+
+          Line formats (short and greppable on purpose):
+
+          ```text
+          FSEXIST <guest path> ok=1 isdir=0            FSEXIST <guest path> ok=0
+          FSLIST <guest path> n=<count>                FSLIST ERR <guest path> err=guest-fs
+          FSATTR <guest path> ok=1 isdir=0 size=<n>    FSATTR ERR <guest path> err=guest-fs
+          FSREADABLE <guest path> ok=<0|1>             FSWRITABLE <guest path> ok=<0|1>
+          PATHJOIN WARNING base="<path>" component=<nil|empty>
+          FSWRITE <guest path> flags=0x<hex> ok=<0|1> [err=guest-fs]
+          FSCREATE <guest path> ok=<0|1> [err=guest-fs]
+          FSOPEN ERR-PC <guest path> pc=0x<hex>
+          FS PROBE SUMMARY frames=<n> exists_ok=<n> ... write_files_err=<n>
+          ```
+
+          Log volume and the rate limit
+          ----------------------------
+          A probe call can run every frame: the v6 log has the same `FSOPEN ok` line 30
+          times at ~10-frame intervals, so a 600-frame run could add thousands of lines
+          for one path. The policy (implemented once, in `fs_probe::should_print`) has
+          two limits that must both agree:
+
+          * per path and outcome - the first 4 successful calls of a path print in full,
+            the first 16 failures do, and after that one call in 200 (success) or one in
+            25 (failure) prints. Failures are kept denser than successes because they are
+            the interesting case, while a success on the same path every frame is the
+            noise the 30 identical opens represent.
+          * globally - after 4000 probe lines (all kinds together) only one event in 100
+            prints, which bounds the case where the app probes thousands of *different*
+            paths (a per-path budget alone would not). The table of seen paths is capped
+            at 4096 entries (keyed by a hash, so it does not keep a copy of every path).
+
+          Counters are updated whether or not the line is printed, so the `FS PROBE
+          SUMMARY` totals stay exact. In the expected case (a few hundred probes for this
+          app) both limits are far from being reached and nothing is sampled away.
+
+          Usage: python3 patch_fsprobe_v7.py [repo-root]   (default: current directory)
+
+          The script applies the edits by exact text replacement, refuses to run unless
+          every anchor matches the expected number of times, skips edits that are already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          LIB_RS = "src/lib.rs"
+          FS_PROBE = "src/fs_probe.rs"
+          FS_RS = "src/fs.rs"
+          POSIX_IO = "src/libc/posix_io.rs"
+          NS_FILE_MANAGER = "src/frameworks/foundation/ns_file_manager.rs"
+          NS_STRING = "src/frameworks/foundation/ns_string.rs"
+          EAGL = "src/frameworks/opengles/eagl.rs"
+          ENVIRONMENT = "src/environment.rs"
+
+          # The whole new module. Kept as one literal so the patch is a single, reviewable
+          # artifact and so "did the trace module change?" is a byte comparison.
+          FS_PROBE_RS = '''/*
+           * This Source Code Form is subject to the terms of the Mozilla Public
+           * License, v. 2.0. If a copy of the MPL was not distributed with this
+           * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+           */
+          //! Patch F (v7): tracing for the guest filesystem's probe, write and create calls.
+          //!
+          //! Patch E (v6) traced the calls that open a file, read a whole file or upload
+          //! a texture. The v6 device log then showed that only nine files were read at
+          //! all (none of them a game resource) and that all 30 `FSOPEN ok` lines point
+          //! at the same *directory*, `<App>/Documents`, retried about once every ten
+          //! frames. Two things were missing from that picture, and this module adds
+          //! them:
+          //!
+          //! * where a path is assembled. `-[NSString stringByAppendingPathComponent:]`
+          //!   returns the receiver unchanged when the component is nil or empty, so a
+          //!   lost file name turns `".../Documents"` into `".../Documents"` - the path
+          //!   the 30 opens use ([note_path_component] prints that case);
+          //! * the calls that probe a path without opening it
+          //!   ([note_exists], [note_directory], [note_attributes], [note_access]), and
+          //!   the calls that create or write a file ([note_write_open], [note_write_file]),
+          //!   which patch E's libc-level `open()` hook never sees.
+          //!
+          //! Nothing here changes emulation behaviour: every function only counts and
+          //! logs. The module deliberately takes no emulator state, so it can be called
+          //! from `crate::fs::Fs::write`, which has none in scope.
+          //!
+          //! Line formats (short and greppable on purpose):
+          //!
+          //! ```text
+          //! FSEXIST <guest path> ok=1 isdir=0            FSEXIST <guest path> ok=0
+          //! FSLIST <guest path> n=<count>                FSLIST ERR <guest path> err=guest-fs
+          //! FSATTR <guest path> ok=1 isdir=0 size=<n>    FSATTR ERR <guest path> err=guest-fs
+          //! FSREADABLE <guest path> ok=<0|1>             FSWRITABLE <guest path> ok=<0|1>
+          //! PATHJOIN WARNING base="<path>" component=<nil|empty>
+          //! FSWRITE <guest path> flags=0x<hex> ok=<0|1> [err=guest-fs]
+          //! FSCREATE <guest path> ok=<0|1> [err=guest-fs]
+          //! FSOPEN ERR-PC <guest path> pc=0x<hex>
+          //! FS PROBE SUMMARY frames=<n> exists_ok=<n> ... write_files_err=<n>
+          //! ```
+          //!
+          //! The guest filesystem layer reports failures as a bare `Err(())` with no
+          //! `errno` (see patch E), so failures say `err=guest-fs`: the path is not in the
+          //! guest tree, or - for a write - it is a directory or an unwritable file.
+
+          use std::collections::HashMap;
+          use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+          use std::sync::{Mutex, OnceLock};
+
+          /// The first this many calls of one outcome on one path print in full.
+          ///
+          /// Four is enough to see the "same path, again and again, never a file"
+          /// pattern the v6 log shows for `<App>/Documents` without printing the same line
+          /// 600 times in a 600-frame run.
+          const HEAD_SUCCESS: u32 = 4;
+          /// Failures are the interesting case, so more of them print in full.
+          const HEAD_FAILURE: u32 = 16;
+          /// After the head, one call in this many prints a line, per path and outcome.
+          const SAMPLE_SUCCESS: u32 = 200;
+          const SAMPLE_FAILURE: u32 = 25;
+
+          /// Backstop for the case the per-path budget cannot bound: an app probing a
+          /// huge number of *different* paths. After this many probe lines (all kinds
+          /// together) only one event in [GLOBAL_SAMPLE] prints.
+          const GLOBAL_BUDGET: u32 = 4000;
+          const GLOBAL_SAMPLE: u32 = 100;
+          /// Number of distinct paths the per-path table remembers. Entries are keyed by
+          /// a hash, so the table never keeps a copy of a path and stays small.
+          const MAX_TRACKED_PATHS: usize = 4096;
+
+          /// The earliest useful snapshot.
+          const FIRST_SUMMARY_FRAME: u64 = 60;
+          /// Then one snapshot every this many frames.
+          const SUMMARY_PERIOD: u64 = 300;
+          /// Patch E's own `-[EAGLContext presentRenderbuffer:]` tick prints the shared
+          /// `FS SUMMARY` line on multiples of this many frames. Patch F must not edit
+          /// that line, so at those frames it only adds its own line: the union of the
+          /// two ticks is 60, 300, 600, 900, ... and no frame prints a summary twice.
+          const E7_SUMMARY_PERIOD: u64 = 600;
+
+          /// Probe lines printed so far (all kinds), for the global backstop.
+          static PROBE_LINES: AtomicU32 = AtomicU32::new(0);
+
+          // Cumulative counters, reported by `print_probe_summary`. They are updated
+          // whether or not a line was printed, so the totals stay exact.
+          static EXISTS_OK: AtomicU32 = AtomicU32::new(0);
+          static EXISTS_ERR: AtomicU32 = AtomicU32::new(0);
+          static LIST_OK: AtomicU32 = AtomicU32::new(0);
+          static LIST_ERR: AtomicU32 = AtomicU32::new(0);
+          static ATTRS_OK: AtomicU32 = AtomicU32::new(0);
+          static ATTRS_ERR: AtomicU32 = AtomicU32::new(0);
+          static READABLE_ERR: AtomicU32 = AtomicU32::new(0);
+          static WRITABLE_ERR: AtomicU32 = AtomicU32::new(0);
+          static PATHJOIN_EMPTY: AtomicU32 = AtomicU32::new(0);
+          static WRITE_OPENS_OK: AtomicU32 = AtomicU32::new(0);
+          static WRITE_OPENS_ERR: AtomicU32 = AtomicU32::new(0);
+          static WRITE_FILES_OK: AtomicU32 = AtomicU32::new(0);
+          static WRITE_FILES_ERR: AtomicU32 = AtomicU32::new(0);
+
+          /// Last frame seen by [note_frame], for [print_final_summary].
+          static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+          /// Guards [print_final_summary] so the final lines print at most once.
+          static FINAL_PRINTED: AtomicBool = AtomicBool::new(false);
+
+          /// Per-path call counts, split by outcome.
+          #[derive(Default)]
+          struct PathCounts {
+              ok: u32,
+              err: u32,
+          }
+
+          fn path_table() -> &'static Mutex<HashMap<u64, PathCounts>> {
+              static TABLE: OnceLock<Mutex<HashMap<u64, PathCounts>>> = OnceLock::new();
+              TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+          }
+
+          /// FNV-1a hash of a path.
+          ///
+          /// A probe site can run every frame, so the table keys on a hash instead of on
+          /// the path itself: no allocation per event and a bounded table entry.
+          fn path_hash(path: &str) -> u64 {
+              let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+              for byte in path.as_bytes() {
+                  hash ^= *byte as u64;
+                  hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+              }
+              hash
+          }
+
+          fn within_head(count: u32, head: u32, sample: u32) -> bool {
+              count < head || count % sample == 0
+          }
+
+          /// Decides whether one probe/write event should print a line.
+          fn should_print(path: &str, failed: bool) -> bool {
+              let global = PROBE_LINES.fetch_add(1, Ordering::Relaxed);
+              if global >= GLOBAL_BUDGET && global % GLOBAL_SAMPLE != 0 {
+                  return false;
+              }
+              let Ok(mut table) = path_table().lock() else {
+                  // The lock can only be poisoned by a panic while it is held, which
+                  // cannot happen here (the critical section only touches the map). If it
+                  // ever is, fall back to the global backstop alone.
+                  return true;
+              };
+              let key = path_hash(path);
+              if table.len() >= MAX_TRACKED_PATHS && !table.contains_key(&key) {
+                  // Out of room: this path keeps no per-path budget of its own and is
+                  // governed by the global backstop above.
+                  return true;
+              }
+              let counts = table.entry(key).or_default();
+              if failed {
+                  let seen = counts.err;
+                  counts.err = seen.saturating_add(1);
+                  within_head(seen, HEAD_FAILURE, SAMPLE_FAILURE)
+              } else {
+                  let seen = counts.ok;
+                  counts.ok = seen.saturating_add(1);
+                  within_head(seen, HEAD_SUCCESS, SAMPLE_SUCCESS)
+              }
+          }
+
+          /// `-[NSFileManager fileExistsAtPath:]` and
+          /// `-[NSFileManager fileExistsAtPath:isDirectory:]`.
+          ///
+          /// `is_dir` is `Some` only for the variant that also asks whether the item is
+          /// a directory.
+          pub fn note_exists(path: &str, exists: bool, is_dir: Option<bool>) {
+              if exists {
+                  EXISTS_OK.fetch_add(1, Ordering::Relaxed);
+              } else {
+                  EXISTS_ERR.fetch_add(1, Ordering::Relaxed);
+              }
+              if !should_print(path, !exists) {
+                  return;
+              }
+              match (exists, is_dir) {
+                  (true, Some(true)) => log!("FSEXIST {} ok=1 isdir=1", path),
+                  (true, Some(false)) => log!("FSEXIST {} ok=1 isdir=0", path),
+                  (true, None) => log!("FSEXIST {} ok=1", path),
+                  (false, _) => log!("FSEXIST {} ok=0", path),
+              }
+          }
+
+          /// `-[NSFileManager directoryContentsAtPath:]`, which
+          /// `-[NSFileManager contentsOfDirectoryAtPath:error:]` forwards to.
+          ///
+          /// `count` is `None` when the directory could not be listed at all, i.e. the
+          /// path does not exist or is not a directory. The count is the point of this
+          /// line: "the bundle directory lists as empty" and "the directory lists fine
+          /// but nothing in it is opened" are different bugs.
+          pub fn note_directory(path: &str, count: Option<usize>) {
+              match count {
+                  Some(entries) => {
+                      LIST_OK.fetch_add(1, Ordering::Relaxed);
+                      if should_print(path, false) {
+                          log!("FSLIST {} n={}", path, entries);
+                      }
+                  }
+                  None => {
+                      LIST_ERR.fetch_add(1, Ordering::Relaxed);
+                      if should_print(path, true) {
+                          log!("FSLIST ERR {} err=guest-fs", path);
+                      }
+                  }
+              }
+          }
+
+          /// `-[NSFileManager attributesOfItemAtPath:error:]`.
+          ///
+          /// `size` is 0 for a directory and for the error case, so the `isdir` field is
+          /// what tells those two apart.
+          pub fn note_attributes(path: &str, exists: bool, is_dir: bool, size: usize) {
+              if exists {
+                  ATTRS_OK.fetch_add(1, Ordering::Relaxed);
+                  if should_print(path, false) {
+                      log!(
+                          "FSATTR {} ok=1 isdir={} size={}",
+                          path,
+                          is_dir as u8,
+                          size
+                      );
+                  }
+              } else {
+                  ATTRS_ERR.fetch_add(1, Ordering::Relaxed);
+                  if should_print(path, true) {
+                      log!("FSATTR ERR {} err=guest-fs", path);
+                  }
+              }
+          }
+
+          /// `-[NSFileManager isReadableFileAtPath:]` (`writable = false`) and
+          /// `-[NSFileManager isWritableFileAtPath:]` (`writable = true`).
+          ///
+          /// Only failures are counted for the summary: every existing file is readable
+          /// and writable in touchHLE, so the interesting case is an answer of NO.
+          pub fn note_access(path: &str, writable: bool, ok: bool) {
+              if !ok {
+                  if writable {
+                      WRITABLE_ERR.fetch_add(1, Ordering::Relaxed);
+                  } else {
+                      READABLE_ERR.fetch_add(1, Ordering::Relaxed);
+                  }
+              }
+              if !should_print(path, !ok) {
+                  return;
+              }
+              if writable {
+                  log!("FSWRITABLE {} ok={}", path, ok as u8);
+              } else {
+                  log!("FSREADABLE {} ok={}", path, ok as u8);
+              }
+          }
+
+          /// `-[NSString stringByAppendingPathComponent:]` with a nil or empty
+          /// component.
+          ///
+          /// `path_algorithms::string_by_appending_path_component` drops empty
+          /// components, so this call returns `base` unchanged: the caller asked for
+          /// "base/name" and got "base". That is how a file name disappears and leaves a
+          /// directory path behind - the path the v6 log shows being opened 30 times.
+          pub fn note_path_component(base: &str, component_is_nil: bool) {
+              PATHJOIN_EMPTY.fetch_add(1, Ordering::Relaxed);
+              if !should_print(base, true) {
+                  return;
+              }
+              log!(
+                  "PATHJOIN WARNING base={:?} component=<{}>",
+                  base,
+                  if component_is_nil { "nil" } else { "empty" }
+              );
+          }
+
+          /// An `open()`-class call that asks to write or create, from
+          /// `crate::libc::posix_io::open_direct`.
+          ///
+          /// That is the one choke point every `open()`, `creat()`, `fopen()` and
+          /// `NSFileHandle` writing factory (`fileHandleForWritingAtPath:`,
+          /// `fileHandleForUpdatingAtPath:`) goes through. `flags` is the guest's
+          /// `open()` flag word, so a failed create (`O_CREAT`) and a failed update
+          /// (`O_WRONLY`/`O_RDWR`) can be told apart.
+          pub fn note_write_open(path: &str, flags: i32, ok: bool) {
+              if ok {
+                  WRITE_OPENS_OK.fetch_add(1, Ordering::Relaxed);
+                  if should_print(path, false) {
+                      log!("FSWRITE {} flags={:#x} ok=1", path, flags);
+                  }
+              } else {
+                  WRITE_OPENS_ERR.fetch_add(1, Ordering::Relaxed);
+                  if should_print(path, true) {
+                      log!("FSWRITE {} flags={:#x} ok=0 err=guest-fs", path, flags);
+                  }
+              }
+          }
+
+          /// A "write this whole file" call, from `crate::fs::Fs::write`.
+          ///
+          /// `Fs::write` opens with write+create+truncate, so this covers
+          /// `-[NSData writeToFile:atomically:]` (and therefore
+          /// `writeToFile:options:error:`, `writeToURL:...`,
+          /// `-[NSFileManager createFileAtPath:contents:attributes:]`),
+          /// `-[NSString writeToFile:...]`, `NSArray`/`NSDictionary writeToFile:`,
+          /// `NSKeyedArchiver` and `NSUserDefaults`. A failure here with a path that is
+          /// a directory is the direct evidence for "the app tried to create a save or
+          /// marker file and could not".
+          pub fn note_write_file(path: &str, ok: bool) {
+              if ok {
+                  WRITE_FILES_OK.fetch_add(1, Ordering::Relaxed);
+                  if should_print(path, false) {
+                      log!("FSCREATE {} ok=1", path);
+                  }
+              } else {
+                  WRITE_FILES_ERR.fetch_add(1, Ordering::Relaxed);
+                  if should_print(path, true) {
+                      log!("FSCREATE {} ok=0 err=guest-fs", path);
+                  }
+              }
+          }
+
+          /// The guest program counter of a failed `open()`, so the retry loop can be
+          /// located in the guest binary.
+          ///
+          /// `pc` is the address just after the guest's `svc` that entered the host, i.e.
+          /// the call site (the same value `environment.rs` calls `svc_pc + 4`).
+          pub fn note_open_failure_pc(path: &str, pc: u32) {
+              if !should_print(path, true) {
+                  return;
+              }
+              log!("FSOPEN ERR-PC {} pc={:#010x}", path, pc);
+          }
+
+          /// Counts one presented frame and prints the periodic file-system summary.
+          ///
+          /// A device run of this app is only a few hundred frames long, so patch E's
+          /// `n % 600 == 0` tick never fired there. This prints at frame 60 and then
+          /// every 300 frames. Multiples of 600 are left to patch E's tick (which this
+          /// patch must not edit), so no frame ever prints the shared `FS SUMMARY` line
+          /// twice; the union of the two ticks is exactly 60, 300, 600, 900, ...
+          pub fn note_frame(frame: u64) {
+              LAST_FRAME.store(frame, Ordering::Relaxed);
+              if frame == FIRST_SUMMARY_FRAME || frame % SUMMARY_PERIOD == 0 {
+                  if frame % E7_SUMMARY_PERIOD != 0 {
+                      crate::fs_trace::print_summary(frame);
+                  }
+                  print_probe_summary(frame, false);
+              }
+          }
+
+          /// The final cumulative summary, printed once when the app exits.
+          ///
+          /// Called from the two "we are done" points in `environment.rs`: the normal
+          /// main-thread exit and the iOS host's stop request. If the app is killed by
+          /// the system instead, the frame ticks above are the last snapshot.
+          pub fn print_final_summary() {
+              if FINAL_PRINTED.swap(true, Ordering::Relaxed) {
+                  return;
+              }
+              let frame = LAST_FRAME.load(Ordering::Relaxed);
+              crate::fs_trace::print_summary(frame);
+              print_probe_summary(frame, true);
+          }
+
+          /// Prints the patch F cumulative counters. Exact totals, independent of the
+          /// rate limit.
+          fn print_probe_summary(frame: u64, final_line: bool) {
+              log!(
+                  "FS PROBE SUMMARY{} frames={} exists_ok={} exists_err={} list_ok={} list_err={} attrs_ok={} attrs_err={} readable_err={} writable_err={} pathjoin_empty={} write_opens_ok={} write_opens_err={} write_files_ok={} write_files_err={}",
+                  if final_line { " final" } else { "" },
+                  frame,
+                  EXISTS_OK.load(Ordering::Relaxed),
+                  EXISTS_ERR.load(Ordering::Relaxed),
+                  LIST_OK.load(Ordering::Relaxed),
+                  LIST_ERR.load(Ordering::Relaxed),
+                  ATTRS_OK.load(Ordering::Relaxed),
+                  ATTRS_ERR.load(Ordering::Relaxed),
+                  READABLE_ERR.load(Ordering::Relaxed),
+                  WRITABLE_ERR.load(Ordering::Relaxed),
+                  PATHJOIN_EMPTY.load(Ordering::Relaxed),
+                  WRITE_OPENS_OK.load(Ordering::Relaxed),
+                  WRITE_OPENS_ERR.load(Ordering::Relaxed),
+                  WRITE_FILES_OK.load(Ordering::Relaxed),
+                  WRITE_FILES_ERR.load(Ordering::Relaxed),
+              );
+          }
+          '''
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, markers that prove the replacement landed). Every
+          # marker must appear exactly `occurrences` times afterwards.
+          EDITS = [
+              (
+                  "F0 lib.rs declares the probe-tracing module",
+                  LIB_RS,
+                  """mod fs;
+          mod fs_trace;
+          """,
+                  """mod fs;
+          mod fs_probe;
+          mod fs_trace;
+          """,
+                  1,
+                  ("mod fs_probe;",),
+              ),
+              (
+                  "F2 open_direct traces failed opens (PC) and write-intent opens",
+                  POSIX_IO,
+                  """    crate::fs_trace::note_open(&actual_path_string, res != -1, flags);
+              log_dbg!(
+          """,
+                  """    crate::fs_trace::note_open(&actual_path_string, res != -1, flags);
+              // Patch F (v7): where in the guest did a failed open come from? `res` is
+              // the result the emulated call is about to return, so this cannot change
+              // it; the call only runs on failure. The guest PC is the address just after
+              // the guest's `svc` that entered the host, i.e. the call site.
+              if res == -1 {
+                  crate::fs_probe::note_open_failure_pc(
+                      &actual_path_string,
+                      env.cpu.pc_with_thumb_bit().addr_with_thumb_bit(),
+                  );
+              }
+              // Patch F (v7): every open() that asks to write or create. This is the
+              // "the app keeps retrying a create/write in Documents" half of the v6
+              // finding; patch E only labelled the successful opens, not what they were
+              // opened for. Same choke point, same `res`, log-only.
+              if flags & (O_CREAT | O_WRONLY | O_RDWR | O_TRUNC) != 0 {
+                  crate::fs_probe::note_write_open(&actual_path_string, flags, res != -1);
+              }
+              log_dbg!(
+          """,
+                  1,
+                  (
+                      "crate::fs_probe::note_open_failure_pc(",
+                      "crate::fs_probe::note_write_open(&actual_path_string, flags, res != -1);",
+                  ),
+              ),
+              (
+                  "F3 Fs::write traces every whole-file write",
+                  FS_RS,
+                  """    /// Like [std::fs::write] but for the guest filesystem.
+              pub fn write<P: AsRef<GuestPath>>(&mut self, path: P, data: &[u8]) -> Result<(), ()> {
+                  let mut options = GuestOpenOptions::new();
+                  options.write().create().truncate();
+                  self.open_with_options(path, options)?
+                      .write_all(data)
+                      .map_err(|_| ())
+              }
+          """,
+                  """    /// Like [std::fs::write] but for the guest filesystem.
+              ///
+              /// Patch F (v7) made this bind its `Result` so the trace below can observe
+              /// the very value that is returned. This is the one guest entry point every
+              /// "write this whole file" call shares: `-[NSData writeToFile:atomically:]`
+              /// (and so `writeToFile:options:error:`, `writeToURL:...`,
+              /// `-[NSFileManager createFileAtPath:contents:attributes:]`),
+              /// `-[NSString writeToFile:...]`, `NSArray`/`NSDictionary writeToFile:`,
+              /// `NSKeyedArchiver` and `NSUserDefaults`. The pre-patch body is the four
+              /// statements below, moved verbatim from the `?`-chain into a `Result`
+              /// binding: which files are written, and whether the write succeeds, is
+              /// unchanged.
+              pub fn write<P: AsRef<GuestPath>>(&mut self, path: P, data: &[u8]) -> Result<(), ()> {
+                  let mut options = GuestOpenOptions::new();
+                  options.write().create().truncate();
+                  let guest_path = path.as_ref();
+                  let result = self
+                      .open_with_options(guest_path, options)
+                      .and_then(|mut file| file.write_all(data).map_err(|_| ()));
+                  crate::fs_probe::note_write_file(guest_path.as_str(), result.is_ok());
+                  result
+              }
+          """,
+                  1,
+                  ("crate::fs_probe::note_write_file(guest_path.as_str(), result.is_ok());",),
+              ),
+              (
+                  "F4a fileExistsAtPath: traces the probe",
+                  NS_FILE_MANAGER,
+                  """- (bool)fileExistsAtPath:(id)path {
+              if path.is_null() {
+                  return false;
+              }
+              let path = ns_string::to_rust_string(env, path);
+              env.fs.exists(GuestPath::new(&path))
+          }
+          """,
+                  """- (bool)fileExistsAtPath:(id)path {
+              if path.is_null() {
+                  return false;
+              }
+              let path = ns_string::to_rust_string(env, path);
+              // Patch F (v7): the callers that only ask "does this exist?" were the one
+              // blind spot left after patch E. The pre-patch tail of this method is the
+              // two lines below, unchanged apart from binding `env.fs.exists(..)` to a
+              // local so the trace observes the same value that is returned.
+              let exists = env.fs.exists(GuestPath::new(&path));
+              crate::fs_probe::note_exists(&path, exists, None);
+              exists
+          }
+          """,
+                  1,
+                  ("crate::fs_probe::note_exists(&path, exists, None);",),
+              ),
+              (
+                  "F4b fileExistsAtPath:isDirectory: traces the probe",
+                  NS_FILE_MANAGER,
+                  """    if env.fs.exists(guest_path) {
+                  if !is_dir_ptr.is_null() {
+                      let is_dir = env.fs.is_dir(guest_path);
+                      env.mem.write(is_dir_ptr, is_dir);
+                  }
+                  true
+              } else {
+                  if !is_dir_ptr.is_null() {
+                      env.mem.write(is_dir_ptr, false);
+                  }
+                  false
+              }
+          """,
+                  """    if env.fs.exists(guest_path) {
+                  // Patch F (v7): the directory flag is now computed unconditionally so
+                  // the trace can report it even when the caller passed a null
+                  // isDirectory pointer. `Fs::is_dir` is a pure query, so the value
+                  // written to is_dir_ptr and the value returned are unchanged.
+                  let is_dir = env.fs.is_dir(guest_path);
+                  if !is_dir_ptr.is_null() {
+                      env.mem.write(is_dir_ptr, is_dir);
+                  }
+                  crate::fs_probe::note_exists(&path_str, true, Some(is_dir));
+                  true
+              } else {
+                  if !is_dir_ptr.is_null() {
+                      env.mem.write(is_dir_ptr, false);
+                  }
+                  crate::fs_probe::note_exists(&path_str, false, None);
+                  false
+              }
+          """,
+                  1,
+                  (
+                      "crate::fs_probe::note_exists(&path_str, true, Some(is_dir));",
+                      "crate::fs_probe::note_exists(&path_str, false, None);",
+                  ),
+              ),
+              (
+                  "F4c isReadableFileAtPath: traces the probe",
+                  NS_FILE_MANAGER,
+                  """- (bool)isReadableFileAtPath:(id)path {
+              if path.is_null() {
+                  return false;
+              }
+              let path = ns_string::to_rust_string(env, path);
+              env.fs.exists(GuestPath::new(&path)) // All existing files are readable
+          }
+          """,
+                  """- (bool)isReadableFileAtPath:(id)path {
+              if path.is_null() {
+                  return false;
+              }
+              let path = ns_string::to_rust_string(env, path);
+              let exists = env.fs.exists(GuestPath::new(&path)); // All existing files are readable
+              // Patch F (v7): same treatment as fileExistsAtPath: above.
+              crate::fs_probe::note_access(&path, false, exists);
+              exists
+          }
+          """,
+                  1,
+                  ("crate::fs_probe::note_access(&path, false, exists);",),
+              ),
+              (
+                  "F4d isWritableFileAtPath: traces the probe",
+                  NS_FILE_MANAGER,
+                  """- (bool)isWritableFileAtPath:(id)path {
+              if path.is_null() {
+                  return false;
+              }
+              let path = ns_string::to_rust_string(env, path);
+              env.fs.exists(GuestPath::new(&path)) // All existing files are writable
+          }
+          """,
+                  """- (bool)isWritableFileAtPath:(id)path {
+              if path.is_null() {
+                  return false;
+              }
+              let path = ns_string::to_rust_string(env, path);
+              let exists = env.fs.exists(GuestPath::new(&path)); // All existing files are writable
+              // Patch F (v7): the writable half of the pair, and the one that matters for
+              // the "the app cannot write its save/marker file" hypothesis.
+              crate::fs_probe::note_access(&path, true, exists);
+              exists
+          }
+          """,
+                  1,
+                  ("crate::fs_probe::note_access(&path, true, exists);",),
+              ),
+              (
+                  "F4e directoryContentsAtPath: traces the listing",
+                  NS_FILE_MANAGER,
+                  """    let path = ns_string::to_rust_string(env, path);
+              let Ok(paths) = env.fs.enumerate(GuestPath::new(&path)) else {
+                  return nil;
+              };
+          """,
+                  """    let path = ns_string::to_rust_string(env, path);
+              let Ok(paths) = env.fs.enumerate(GuestPath::new(&path)) else {
+                  // Patch F (v7): `contentsOfDirectoryAtPath:error:` forwards here, so
+                  // this single insertion covers both spellings.
+                  crate::fs_probe::note_directory(&path, None);
+                  return nil;
+              };
+          """,
+                  1,
+                  ("crate::fs_probe::note_directory(&path, None);",),
+              ),
+              (
+                  "F4f directoryContentsAtPath: traces the number of entries",
+                  NS_FILE_MANAGER,
+                  """    log_dbg!("directoryContentsAtPath {}: {:?}", path, paths);
+          """,
+                  """    // Patch F (v7): how many entries the directory really has. "lists as
+              // empty" and "lists fine but nothing in it is ever opened" are different
+              // bugs, and this line tells them apart.
+              crate::fs_probe::note_directory(&path, Some(paths.len()));
+              log_dbg!("directoryContentsAtPath {}: {:?}", path, paths);
+          """,
+                  1,
+                  ("crate::fs_probe::note_directory(&path, Some(paths.len()));",),
+              ),
+              (
+                  "F4g attributesOfItemAtPath: traces both probe outcomes",
+                  NS_FILE_MANAGER,
+                  """    if !env.fs.exists(guest_path) {
+                  if !error.is_null() {
+                      let domain = get_static_str(env, NSCocoaErrorDomain);
+                      let ns_error = msg_class![env; NSError alloc];
+                      let ns_error = msg![env; ns_error initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
+                      env.mem.write(error, ns_error);
+                  }
+                  return nil;
+              }
+
+              let is_dir = env.fs.is_dir(guest_path);
+              let file_size = if is_dir { 0 } else { env.fs.read(guest_path).map(|d| d.len()).unwrap_or(0) };
+          """,
+                  """    if !env.fs.exists(guest_path) {
+                  if !error.is_null() {
+                      let domain = get_static_str(env, NSCocoaErrorDomain);
+                      let ns_error = msg_class![env; NSError alloc];
+                      let ns_error = msg![env; ns_error initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
+                      env.mem.write(error, ns_error);
+                  }
+                  // Patch F (v7): the attribute query that answers "no such file" is a
+                  // probe the app makes before it decides not to open anything.
+                  crate::fs_probe::note_attributes(&path_str, false, false, 0);
+                  return nil;
+              }
+
+              let is_dir = env.fs.is_dir(guest_path);
+              let file_size = if is_dir { 0 } else { env.fs.read(guest_path).map(|d| d.len()).unwrap_or(0) };
+              // Patch F (v7): size 0 with isdir=0 is a zero-byte file; isdir=1 is a
+              // directory. Both are worth seeing next to the open that follows.
+              crate::fs_probe::note_attributes(&path_str, true, is_dir, file_size);
+          """,
+                  1,
+                  (
+                      "crate::fs_probe::note_attributes(&path_str, false, false, 0);",
+                      "crate::fs_probe::note_attributes(&path_str, true, is_dir, file_size);",
+                  ),
+              ),
+              (
+                  "F5 stringByAppendingPathComponent: warns about a nil/empty component",
+                  NS_STRING,
+                  """- (id)stringByAppendingPathComponent:(id)component {
+              let base_str = to_rust_string(env, this);
+              let component_str = to_rust_string(env, component);
+              let res = path_algorithms::string_by_appending_path_component(&base_str, &component_str);
+          """,
+                  """- (id)stringByAppendingPathComponent:(id)component {
+              let base_str = to_rust_string(env, this);
+              let component_str = to_rust_string(env, component);
+              // Patch F (v7): the highest-value line in this patch. `to_rust_string`
+              // maps nil to "", and `string_by_appending_path_component` drops empty
+              // components, so a nil or empty component makes this method return `base`
+              // unchanged: the caller asked for "base/name" and got "base". That is how
+              // the 30 `FSOPEN ok <App>/Documents` lines in the v6 log are produced - a
+              // file name is lost here and nowhere else. Log only; `res` is untouched.
+              if component.is_null() || component_str.is_empty() {
+                  crate::fs_probe::note_path_component(&base_str, component.is_null());
+              }
+              let res = path_algorithms::string_by_appending_path_component(&base_str, &component_str);
+          """,
+                  1,
+                  ("crate::fs_probe::note_path_component(&base_str, component.is_null());",),
+              ),
+              (
+                  "F6 presentRenderbuffer drives the earlier summary cadence",
+                  EAGL,
+                  """        // Patch E (v6): cumulative file-access / texture-upload / draw counters
+                  // every 600 guest frames (~10 s at 60 FPS). This reuses the frame
+                  // counter already in scope rather than adding one.
+                  if n % 600 == 0 {
+                      crate::fs_trace::print_summary(n);
+                  }
+              }
+          """,
+                  """        // Patch E (v6): cumulative file-access / texture-upload / draw counters
+                  // every 600 guest frames (~10 s at 60 FPS). This reuses the frame
+                  // counter already in scope rather than adding one.
+                  if n % 600 == 0 {
+                      crate::fs_trace::print_summary(n);
+                  }
+
+                  // Patch F (v7): a real device run of this app is only a few hundred
+                  // frames long, so the 600-frame tick above never fired and the counters
+                  // were never printed. The module prints patch E's shared summary plus
+                  // its own counters at frame 60 and then every 300 frames, skipping the
+                  // multiples of 600 above (whose line this patch must not edit). The
+                  // union of the two ticks is exactly 60, 300, 600, 900, ... with no
+                  // frame printing a summary twice. Log only; `n` is read, not changed.
+                  crate::fs_probe::note_frame(n);
+              }
+          """,
+                  1,
+                  ("crate::fs_probe::note_frame(n);",),
+              ),
+              (
+                  "F7a environment.rs prints the final summary when the app exits",
+                  ENVIRONMENT,
+                  """                            log_no_panic!("Main thread exited normally (or crashed early). Returning to host.");
+          """,
+                  """                            log_no_panic!("Main thread exited normally (or crashed early). Returning to host.");
+                                      // Patch F (v7): one last cumulative snapshot, since
+                                      // the periodic ticks only run while frames are
+                                      // being presented. Log only.
+                                      crate::fs_probe::print_final_summary();
+          """,
+                  1,
+                  ("one last cumulative snapshot",),
+              ),
+              (
+                  "F7b environment.rs prints the final summary when the host stops us",
+                  ENVIRONMENT,
+                  """                echo!("Returning to the iOS host library.");
+          """,
+                  """                echo!("Returning to the iOS host library.");
+                          // Patch F (v7): the host asked the core to stop, which on a
+                          // device is how a run actually ends. Log only.
+                          crate::fs_probe::print_final_summary();
+          """,
+                  1,
+                  ("the host asked the core to stop",),
+              ),
+          ]
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def balance(text):
+              return text.count("{") == text.count("}")
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              targets = sorted({edit[1] for edit in EDITS} | {FS_PROBE})
+              texts = {}
+              for target in targets:
+                  path = repo / target
+                  if path.is_file():
+                      texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                  elif target == FS_PROBE:
+                      texts[target] = None
+                  else:
+                      fail("{} does not exist".format(path))
+
+              # F1: the new module. Unlike the other files it is created rather than
+              # edited, so idempotency is "is it already there?" plus "is the existing
+              # copy one the patch can recognise?".
+              if texts[FS_PROBE] is None:
+                  if not balance(FS_PROBE_RS):
+                      fail("the probe module the script carries is brace-unbalanced")
+                  texts[FS_PROBE] = FS_PROBE_RS
+                  print("created: F1 {} ({} bytes)".format(FS_PROBE, len(FS_PROBE_RS)))
+              elif "pub fn note_exists(path: &str, exists: bool, is_dir: Option<bool>)" in texts[FS_PROBE]:
+                  print("already applied: F1 {} (leaving the existing copy alone)".format(FS_PROBE))
+              else:
+                  fail("{} already exists but does not look like the probe module; refusing to overwrite".format(FS_PROBE))
+
+              for name, target, old, new, occurrences, markers in EDITS:
+                  text = texts[target]
+                  if all(marker in text for marker in markers):
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  for marker in markers:
+                      if replaced.count(marker) != occurrences:
+                          fail("{}: \"{}\" landed {} time(s) for marker {!r}, expected {}".format(
+                              target, name, replaced.count(marker), marker, occurrences))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              for name, target, _old, _new, occurrences, markers in EDITS:
+                  for marker in markers:
+                      if texts[target].count(marker) != occurrences:
+                          fail("{}: post-condition failed for \"{}\": {} occurrence(s) of {!r}, expected {}".format(
+                              target, name, texts[target].count(marker), marker, occurrences))
+
+              for target, text in texts.items():
+                  if not balance(text):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+              # Patch F must not have changed a single line patches A-E inserted. The
+              # cheapest proof is the markers the v7 self-check asserts; the two most
+              # load-bearing ones are re-checked here (patch E's own summary tick and its
+              # open hook), together with the two patch F lines that share their site.
+              posix = texts[POSIX_IO]
+              for name, marker, expected in (
+                  ("E2 open hook", "crate::fs_trace::note_open(&actual_path_string, res != -1, flags);", 1),
+                  ("F2 failed-open PC", "crate::fs_probe::note_open_failure_pc(", 1),
+                  ("F2 write-intent open", "crate::fs_probe::note_write_open(&actual_path_string, flags, res != -1);", 1),
+              ):
+                  if posix.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          POSIX_IO, name, posix.count(marker), expected))
+              eagl = texts[EAGL]
+              for name, marker, expected in (
+                  ("E7 summary tick", "if n % 600 == 0 {", 1),
+                  ("E7 summary call", "crate::fs_trace::print_summary(n);", 1),
+                  ("F6 frame tick", "crate::fs_probe::note_frame(n);", 1),
+              ):
+                  if eagl.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          EAGL, name, eagl.count(marker), expected))
+              if texts[ENVIRONMENT].count("crate::fs_probe::print_final_summary();") != 2:
+                  fail("{}: the final summary is not on both exit paths".format(ENVIRONMENT))
+              print("post-check: patch E's summary tick and open hook are untouched, the two "
+                    "write/open traces and the frame tick are in place, and the final summary "
+                    "sits on both exit paths")
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_F_PY
 
       - name: Check that the patches really landed
         run: |
           set -eu
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
-          # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5) and
-          # the file-access / texture-upload tracing (E, v6).
+          # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5), the
+          # file-access / texture-upload tracing (E, v6) and the filesystem probe / write
+          # tracing (F, v7).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
-          # sends the app's EUC-KR text through the UTF-8 default, or still prints only
-          # the first texture upload of a run.
+          # sends the app's EUC-KR text through the UTF-8 default, still prints only the
+          # first texture upload of a run, or still cannot show the probe and write calls
+          # that explain a path which is opened over and over but is never a file.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -2160,6 +3183,210 @@ jobs:
                 "path can only be observed, never changed")
           CHECK_FSTRACE
 
+          echo "== patch F (v7): filesystem probe / write tracing =="
+          # Every marker below is a line patch F inserts, or - for the markers with a
+          # count of 0 - a string that must not appear in a file patch F does not touch.
+          # The counts are exact, so a duplicated or missing insertion fails the build.
+          probe=src/fs_probe.rs
+          if [ ! -f "$probe" ]; then
+            echo "::error::patch F did not create $probe"
+            exit 1
+          fi
+          check_marker "$probe" "pub fn note_exists(path: &str, exists: bool, is_dir: Option<bool>)" 1
+          check_marker "$probe" "pub fn note_directory(path: &str, count: Option<usize>)" 1
+          check_marker "$probe" "pub fn note_attributes(path: &str, exists: bool, is_dir: bool, size: usize)" 1
+          check_marker "$probe" "pub fn note_access(path: &str, writable: bool, ok: bool)" 1
+          check_marker "$probe" "pub fn note_path_component(base: &str, component_is_nil: bool)" 1
+          check_marker "$probe" "pub fn note_write_open(path: &str, flags: i32, ok: bool)" 1
+          check_marker "$probe" "pub fn note_write_file(path: &str, ok: bool)" 1
+          check_marker "$probe" "pub fn note_open_failure_pc(path: &str, pc: u32)" 1
+          check_marker "$probe" "pub fn note_frame(frame: u64)" 1
+          check_marker "$probe" "pub fn print_final_summary()" 1
+          # The line formats the task asked for. The FSEXIST markers are the four whole
+          # log! literals, not a prefix of one another, so each one counts exactly once.
+          check_marker "$probe" 'log!("FSEXIST {} ok=1 isdir=1", path),' 1
+          check_marker "$probe" 'log!("FSEXIST {} ok=1 isdir=0", path),' 1
+          check_marker "$probe" 'log!("FSEXIST {} ok=1", path),' 1
+          check_marker "$probe" 'log!("FSEXIST {} ok=0", path),' 1
+          check_marker "$probe" "FSLIST {} n={}" 1
+          check_marker "$probe" "FSLIST ERR {} err=guest-fs" 1
+          check_marker "$probe" "FSATTR {} ok=1 isdir={} size={}" 1
+          check_marker "$probe" "FSATTR ERR {} err=guest-fs" 1
+          check_marker "$probe" "FSREADABLE {} ok={}" 1
+          check_marker "$probe" "FSWRITABLE {} ok={}" 1
+          check_marker "$probe" "PATHJOIN WARNING base={:?} component=<{}>" 1
+          check_marker "$probe" "FSWRITE {} flags={:#x} ok=1" 1
+          check_marker "$probe" "FSWRITE {} flags={:#x} ok=0 err=guest-fs" 1
+          check_marker "$probe" "FSCREATE {} ok=1" 1
+          check_marker "$probe" "FSCREATE {} ok=0 err=guest-fs" 1
+          check_marker "$probe" "FSOPEN ERR-PC {} pc={:#010x}" 1
+          check_marker "$probe" "FS PROBE SUMMARY{} frames={}" 1
+          # The rate-limit policy and the summary cadence, with the exact values the
+          # documentation quotes.
+          check_marker "$probe" "const HEAD_SUCCESS: u32 = 4;" 1
+          check_marker "$probe" "const HEAD_FAILURE: u32 = 16;" 1
+          check_marker "$probe" "const SAMPLE_SUCCESS: u32 = 200;" 1
+          check_marker "$probe" "const SAMPLE_FAILURE: u32 = 25;" 1
+          check_marker "$probe" "const GLOBAL_BUDGET: u32 = 4000;" 1
+          check_marker "$probe" "const GLOBAL_SAMPLE: u32 = 100;" 1
+          check_marker "$probe" "const MAX_TRACKED_PATHS: usize = 4096;" 1
+          check_marker "$probe" "const FIRST_SUMMARY_FRAME: u64 = 60;" 1
+          check_marker "$probe" "const SUMMARY_PERIOD: u64 = 300;" 1
+          check_marker "$probe" "const E7_SUMMARY_PERIOD: u64 = 600;" 1
+
+          check_marker src/lib.rs "mod fs_probe;" 1
+          check_marker src/libc/posix_io.rs "crate::fs_probe::note_write_open(&actual_path_string, flags, res != -1);" 1
+          check_marker src/libc/posix_io.rs "crate::fs_probe::note_open_failure_pc(" 1
+          check_marker src/fs.rs "crate::fs_probe::note_write_file(guest_path.as_str(), result.is_ok());" 1
+          file_manager=src/frameworks/foundation/ns_file_manager.rs
+          check_marker "$file_manager" "crate::fs_probe::note_exists(&path, exists, None);" 1
+          check_marker "$file_manager" "crate::fs_probe::note_exists(&path_str, true, Some(is_dir));" 1
+          check_marker "$file_manager" "crate::fs_probe::note_exists(&path_str, false, None);" 1
+          check_marker "$file_manager" "crate::fs_probe::note_access(&path, false, exists);" 1
+          check_marker "$file_manager" "crate::fs_probe::note_access(&path, true, exists);" 1
+          check_marker "$file_manager" "crate::fs_probe::note_directory(&path, None);" 1
+          check_marker "$file_manager" "crate::fs_probe::note_directory(&path, Some(paths.len()));" 1
+          check_marker "$file_manager" "crate::fs_probe::note_attributes(&path_str, false, false, 0);" 1
+          check_marker "$file_manager" "crate::fs_probe::note_attributes(&path_str, true, is_dir, file_size);" 1
+          check_marker src/frameworks/foundation/ns_string.rs "crate::fs_probe::note_path_component(&base_str, component.is_null());" 1
+          check_marker src/frameworks/opengles/eagl.rs "crate::fs_probe::note_frame(n);" 1
+          check_marker src/environment.rs "crate::fs_probe::print_final_summary();" 2
+          # Patch F must not have changed a single line patch E inserted: E7's own
+          # periodic tick is still there (the v7 summary cadence is the union of the two
+          # ticks, and patch F never edits E's line), and neither patch F nor any other
+          # patch touched the files patch A-E own elsewhere.
+          check_marker src/frameworks/opengles/eagl.rs "if n % 600 == 0 {" 1
+          check_marker src/frameworks/opengles/eagl.rs "crate::fs_trace::print_summary(n);" 1
+          check_marker src/fs_trace.rs "fs_probe" 0
+          check_marker src/frameworks/opengles/gles_guest.rs "fs_probe" 0
+          check_marker src/frameworks/foundation/ns_bundle.rs "fs_probe" 0
+          check_marker src/frameworks/core_foundation/cf_url.rs "fs_probe" 0
+          check_marker src/frameworks/core_foundation/cf_string.rs "fs_probe" 0
+
+          python3 - <<'CHECK_FSPROBE'
+          import pathlib
+          import re
+          import sys
+
+          # Structural checks a substring count cannot make: every trace call has to sit
+          # where it can only observe the emulated value, the two pre-patch bodies patch F
+          # rewrote into local bindings have to be intact, the module itself has to be
+          # incapable of changing emulation, and the summary cadence has to be the union
+          # the documentation describes.
+          problems = []
+
+          probe = pathlib.Path("src/fs_probe.rs").read_text(encoding="utf-8")
+          posix = pathlib.Path("src/libc/posix_io.rs").read_text(encoding="utf-8")
+          fs = pathlib.Path("src/fs.rs").read_text(encoding="utf-8")
+          fm = pathlib.Path("src/frameworks/foundation/ns_file_manager.rs").read_text(encoding="utf-8")
+          nsstr = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
+          eagl = pathlib.Path("src/frameworks/opengles/eagl.rs").read_text(encoding="utf-8")
+          env_rs = pathlib.Path("src/environment.rs").read_text(encoding="utf-8")
+
+          # The probe module must be a pure logger.
+          for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
+                      "std::process::", "std::fs::", "Environment", "env."):
+              if bad in probe:
+                  problems.append("src/fs_probe.rs: contains {!r}, which instrumentation must not use".format(bad))
+
+          # F2: both new statements sit after the emulated result exists and before it is
+          # returned, and neither assigns to it.
+          open_body = posix[posix.index("pub fn open_direct("):]
+          open_body = open_body[:open_body.index("\npub fn read(")]
+          for call in ("crate::fs_probe::note_write_open(&actual_path_string, flags, res != -1);",
+                       "crate::fs_probe::note_open_failure_pc("):
+              try:
+                  if not open_body.index("let res = match env") < open_body.index(call) < open_body.rindex("    res\n"):
+                      problems.append("src/libc/posix_io.rs: {} is not between the open and the return of `res`".format(call))
+              except ValueError as error:
+                  problems.append("src/libc/posix_io.rs: {}".format(error))
+          if len(re.findall(r"(?m)^\s*res\s*=[^=]", open_body)) != 0:
+              problems.append("src/libc/posix_io.rs: patch F introduced an assignment to `res`")
+
+          # F3: Fs::write is still the same three-statement body, bound to a Result.
+          write_body = fs[fs.index("pub fn write<P: AsRef<GuestPath>>(&mut self, path: P, data: &[u8]) -> Result<(), ()> {"):]
+          write_body = write_body[:write_body.index("\n    }")]
+          for line in ("        let mut options = GuestOpenOptions::new();",
+                       "        options.write().create().truncate();",
+                       "            .open_with_options(guest_path, options)",
+                       "            .and_then(|mut file| file.write_all(data).map_err(|_| ()));"):
+              if line not in write_body:
+                  problems.append("src/fs.rs: the pre-patch write body line {!r} is missing".format(line))
+          if "options)?" in write_body:
+              problems.append("src/fs.rs: Fs::write still returns early on open failure, so the failure is untraced")
+          if not write_body.rstrip().endswith("result"):
+              problems.append("src/fs.rs: Fs::write no longer returns the traced Result")
+
+          # F4: each probe hook reports the very value the method returns, next to it.
+          if "let exists = env.fs.exists(GuestPath::new(&path));\n    crate::fs_probe::note_exists(&path, exists, None);\n    exists\n}" not in fm:
+              problems.append("ns_file_manager.rs: fileExistsAtPath: does not return the value it traces")
+          if "let exists = env.fs.exists(GuestPath::new(&path)); // All existing files are writable\n    // Patch F (v7): the writable half of the pair, and the one that matters for\n    // the \"the app cannot write its save/marker file\" hypothesis.\n    crate::fs_probe::note_access(&path, true, exists);\n    exists\n}" not in fm:
+              problems.append("ns_file_manager.rs: isWritableFileAtPath: does not return the value it traces")
+          # The isDirectory flag is computed before it is written and traced, so the trace
+          # reports what the caller was told.
+          is_dir_at = fm.index("let is_dir = env.fs.is_dir(guest_path);\n        if !is_dir_ptr.is_null() {")
+          write_at = fm.index("env.mem.write(is_dir_ptr, is_dir);", is_dir_at)
+          trace_at = fm.index("crate::fs_probe::note_exists(&path_str, true, Some(is_dir));", write_at)
+          if not is_dir_at < write_at < trace_at:
+              problems.append("ns_file_manager.rs: the isDirectory trace does not follow the value it reports")
+
+          # F5: the warning is inside stringByAppendingPathComponent: and ahead of the call
+          # that actually drops the empty component.
+          append_impl = nsstr[nsstr.index("- (id)stringByAppendingPathComponent:(id)component {"):]
+          append_impl = append_impl[:append_impl.index("\n}")]
+          for needed in ("let component_str = to_rust_string(env, component);",
+                         "if component.is_null() || component_str.is_empty() {",
+                         "crate::fs_probe::note_path_component(&base_str, component.is_null());"):
+              if needed not in append_impl:
+                  problems.append("ns_string.rs: {!r} is not in stringByAppendingPathComponent:".format(needed))
+          if not append_impl.index("note_path_component") < append_impl.index("let res = path_algorithms::string_by_appending_path_component"):
+              problems.append("ns_string.rs: the path-join warning comes after the path is already built")
+
+          # F6: the frame tick is inside presentRenderbuffer and E7's tick is untouched.
+          present = eagl[eagl.index("- (bool)presentRenderbuffer:(NSUInteger)target {"):]
+          present = present[:present.index("\n    assert!(target == gles11::RENDERBUFFER_OES);")]
+          for needed in ("static FRAME_COUNTER: AtomicU64", "if n % 600 == 0 {",
+                         "crate::fs_trace::print_summary(n);", "crate::fs_probe::note_frame(n);"):
+              if needed not in present:
+                  problems.append("eagl.rs: {!r} is not in presentRenderbuffer".format(needed))
+          if not present.index("crate::fs_trace::print_summary(n);") < present.index("crate::fs_probe::note_frame(n);"):
+              problems.append("eagl.rs: patch F's frame tick is not beside patch E's summary")
+          # The cadence the module documents is 60 then every 300; multiples of 600 are
+          # left to E7's tick. Both halves must be present in the module.
+          for needed in ("if frame == FIRST_SUMMARY_FRAME || frame % SUMMARY_PERIOD == 0 {",
+                         "if frame % E7_SUMMARY_PERIOD != 0 {",
+                         "crate::fs_trace::print_summary(frame);"):
+              if needed not in probe:
+                  problems.append("src/fs_probe.rs: the summary cadence is missing {!r}".format(needed))
+
+          # F7: the final summary sits on both exit paths, after the log line of each.
+          main_exit = env_rs.index("Main thread exited normally")
+          if env_rs.index("crate::fs_probe::print_final_summary();", main_exit) - main_exit > 400:
+              problems.append("src/environment.rs: no final summary near the main-thread exit")
+          host_exit = env_rs.index("Returning to the iOS host library.")
+          if env_rs.index("crate::fs_probe::print_final_summary();", host_exit) - host_exit > 400:
+              problems.append("src/environment.rs: no final summary near the host stop path")
+
+          for name in ("src/lib.rs", "src/libc/posix_io.rs", "src/fs.rs",
+                       "src/frameworks/foundation/ns_file_manager.rs",
+                       "src/frameworks/foundation/ns_string.rs",
+                       "src/frameworks/opengles/eagl.rs", "src/environment.rs",
+                       "src/fs_probe.rs"):
+              content = pathlib.Path(name).read_text(encoding="utf-8")
+              if content.count("{") != content.count("}"):
+                  problems.append("{}: braces are unbalanced".format(name))
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch F: the probe/write trace module, all nine NSFileManager probe hooks, "
+                "the path-join warning, the write-intent open hook, the whole-file write hook, "
+                "the failed-open PC hook, the 60/300-frame summary cadence and the final "
+                "summary on both exit paths are in place, and every patch F call site can only "
+                "observe, never change, the emulated result")
+          CHECK_FSPROBE
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -2248,7 +3475,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v6
+          name: hyperhle-core-ios-arm64-v7
           path: dist/*
           if-no-files-found: error
           retention-days: 30
