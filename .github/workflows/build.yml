@@ -3256,7 +3256,7 @@ jobs:
           fi
 
           echo "== v16: the CJK/Arabic glyph-id pipeline is compiled in =="
-          for marker in "CTFONTGLYPHS ctfont=" "CGFONTGLYPHS font=" "CGGLYPHS {} font="; do
+          for marker in "CTFONTGLYPHS ctfont=" "CGFONTGLYPHS font=" "CGGLYPHS " "DRAWFONT entry="; do
             found=$(strings "$dylib" | grep -c -F -- "$marker" || true)
             echo "$marker occurrences: $found"
             if [ "$found" -lt 1 ]; then
