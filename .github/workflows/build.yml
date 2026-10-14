@@ -11,10 +11,25 @@
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v5 variant of build-core.yml (v1). build-core-v2.yml added the
-# logging; v3 added the first patch that fixes a bug instead of instrumenting
-# one; v4 corrected that patch and added two fields to the log it was hidden
-# behind; v5 makes the emulator decode EUC-KR, the encoding the app asks for:
+# Builds the iOS emulator core (libhyperhle_core.dylib) for Applesauce on a
+# GitHub-hosted macOS machine, so the core can be built without owning a Mac.
+#
+# How to use it: put this file in a repository as .github/workflows/build.yml,
+# then open the Actions tab, pick "Build iOS emulator core (dylib)" and press
+# "Run workflow". A run takes about 20-40 minutes; the finished dylib is in the
+# Artifacts section at the bottom of the run page.
+#
+# Nothing needs to be forked. The job checks out the upstream Applesauce
+# repository at a fixed commit on the runner itself, applies five patches,
+# builds the core, verifies the result and uploads it. This file is the only
+# file the account running it needs.
+#
+# This is the v6 variant of build-core.yml (v1). v2 added the logging; v3 added
+# the first patch that fixes a bug instead of instrumenting one; v4 corrected
+# that patch and added two fields to the log it was hidden behind; v5 makes the
+# emulator decode EUC-KR, the encoding the app asks for; v6 adds the
+# file-access and texture-upload tracing that explains a black screen (it is
+# instrumentation only, like v2's):
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -32,8 +47,8 @@
 #     lproj and directory, the only combination that reaches the plain
 #     <bundle>/<name> path, and logs the directory and lproj of every failed
 #     lookup so the two components can no longer be confused.
-#   patch D (new in v5) teaches the core the one encoding the app under test
-#     keeps asking for and touchHLE did not implement: EUC-KR. A v4 run printed
+#   patch D (v5) teaches the core the one encoding the app under test keeps
+#     asking for and touchHLE did not implement: EUC-KR. A v4 run printed
 #     14,420 "Unhandled CFStringEncoding 0x940" warnings (9,349 of them in a
 #     row, and nothing else) while the game sat at 26% of its loading bar.
 #     0x940 is kCFStringEncodingEUC_KR, so the app's Korean text tables fell
@@ -43,9 +58,20 @@
 #     decodes it with encoding_rs::EUC_KR, which is already a dependency of the
 #     crate; it leaves the unsupported-encoding fallback in place for every
 #     other encoding.
-# The artifact is named hyperhle-core-ios-arm64-v5 so it cannot be mistaken for
-# the v1, v2, v3 or v4 dylib.
-
+#   patch E (new in v6) is instrumentation, like patch B. The v5 core starts the
+#     game, runs its render loop at 60 FPS and still shows an almost black
+#     screen, and the v5 log can only offer the *first* texture upload of the
+#     run (a 1x1 placeholder, which is what a failed image load leaves behind).
+#     Patch E traces what the app really does: every guest open()/fopen()/
+#     NSFileHandle call (one hook in posix_io::open_direct) and every "read this
+#     whole file" call (one hook in Fs::read, which NSData, UIImage and
+#     CGDataProvider all go through), every glTexImage2D and
+#     glCompressedTexImage2D upload with its size, a count of glDrawArrays/
+#     glDrawElements, and one cumulative "FS SUMMARY" line every 600 guest
+#     frames. No pixel data is ever logged and no return value or branch is
+#     touched; the rate limit and the counters live in the new src/fs_trace.rs.
+# The artifact is named hyperhle-core-ios-arm64-v6 so it cannot be mistaken for
+# the v1..v5 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -131,7 +157,7 @@ jobs:
           echo "python: $(python3 --version)"
 
       - name: Patch in the missing CoreFoundation API, the logging instrumentation,
-             the bundle-root fallback and the EUC-KR decoding
+             the bundle-root fallback, the EUC-KR decoding and the file/texture tracing
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -1154,16 +1180,619 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_D_PY
+          python3 - <<'PATCH_E_PY'
+          #!/usr/bin/env python3
+          """File-access and texture-upload tracing (patch E, v6) for the Applesauce iOS core.
+
+          Counterpart of patch_cf_url.py (patch A), patch_logging_v2.py (patch B),
+          patch_ns_bundle_root_fallback_v4.py (patch C) and patch_euckr_v5.py (patch D).
+          Like patch B this one is instrumentation only: it adds no API, no fallback and
+          no behaviour change. Every edit below either inserts one statement or moves an
+          existing function body verbatim; nothing here changes a return value, a
+          condition or a control-flow edge.
+
+          What it is for
+          --------------
+          The v5 core starts the game, runs its render loop at 60 FPS and its compositor
+          at 120 FPS, and still shows an almost black screen: only the top-left
+          `Ver. 1.0.0` text and a blue bar at the bottom. The v5/earlier logs cannot
+          explain that, because they only ever record the *first* texture upload:
+
+              First glTexImage2D(1x1, internalformat=0x1908, format=0x1908, type=0x1401) ...
+
+          A 1x1 rgba8888 texture is the shape of a placeholder uploaded after an image
+          failed to load, but with "first call only" logging there is no way to tell how
+          many textures the app uploaded after it, or at which sizes. The same gap exists
+          on the input side: the bundle-lookup log shows 40 misses (10 distinct .png
+          names), the app itself printed `Fail to Create data` six times, and nothing
+          records which files it *did* manage to open or read.
+
+          Patch E closes that gap with three traces, all of them text-only:
+
+            E1  guest file opens. `posix_io::open_direct` is the single choke point for
+                `open()`, `creat()`, `fopen()` (stdio routes through it), the three
+                `NSFileHandle` factory methods and `mmap`, so one call site there covers
+                every guest `open`-class call.
+            E2  guest "read this whole file" calls. `Fs::read` is the single choke point
+                for `NSData -initWithContentsOfFile:` (and therefore also
+                `dataWithContentsOfFile:` and `contentsOfFile:`),
+                `UIImage imageWithContentsOfFile:`, `CGDataProvider`,
+                `NSString stringWithContentsOfFile:`, `NSFileManager contentsAtPath:`,
+                `NSPropertyListSerialization`, libxml2 and the audio loader.
+            E3  texture uploads and draw calls. `glTexImage2D` and
+                `glCompressedTexImage2D` now print every upload's size instead of the
+                first call only, `glDrawArrays`/`glDrawElements` are counted, and
+                `EAGLContext -presentRenderbuffer:` prints one cumulative summary line
+                every 600 guest frames (~10 s at 60 FPS).
+
+          The logging itself lives in the new module `src/fs_trace.rs` so that the
+          rate-limiting policy has exactly one implementation and every call site is a
+          single added statement that cannot see or influence the emulated result.
+
+          What it changes
+          ---------------
+            E0  `src/lib.rs` declares `mod fs_trace;`.
+            E1  `src/fs_trace.rs` (new file, 6 functions + 7 counters): the trace module.
+            E2  `src/libc/posix_io.rs`, `open_direct`: one call to `fs_trace::note_open`
+                after the open has been performed and before the existing `log_dbg!` that
+                already prints the same information at debug level (which is disabled on
+                device, see `log::ENABLED_MODULES`).
+            E3  `src/fs.rs`, `Fs::read`: the pre-patch body moves verbatim into a new
+                private `read_inner`, and `read` becomes a wrapper that traces the
+                `Result` it got from `read_inner` and returns it unchanged. This is the
+                one edit that touches an existing function, and it is deliberately a
+                move-not-a-change: `read_inner`'s body is byte-identical to the old
+                `read` body (the self-check asserts the marker line of that body).
+            E4  `src/frameworks/opengles/gles_guest.rs`, `glTexImage2D`: the
+                `log_once`-style `SEEN` block that printed the first upload is replaced by
+                a call to `fs_trace::note_tex_upload`.
+            E5  same file, `glCompressedTexImage2D`: the same replacement for the PVRTC
+                path, `fs_trace::note_compressed_tex_upload`. A PVRTC-only app would
+                otherwise show zero texture uploads.
+            E6  same file, `glDrawArrays` and `glDrawElements`: one added
+                `fs_trace::note_draw()` each. Their pre-existing "first draw" logs stay.
+            E7  `src/frameworks/opengles/eagl.rs`, `-[EAGLContext presentRenderbuffer:]`:
+                the existing per-frame counter block gains a `n % 600 == 0` summary tick.
+                It reuses the frame counter that is already there instead of adding one.
+
+          Log volume
+          ----------
+          A trace line is about 100-160 bytes (`touchHLE::fs_trace: ` prefix + path).
+          Expected volume for this app: the whole startup sequence is a few hundred file
+          accesses plus a few hundred uploads, i.e. ~1000 lines and well under 200 KB on
+          top of a log that was already 70 KB - 2.8 MB.
+
+          The rate limit (implemented once, in `fs_trace::within_trace_budget`): an event
+          prints one line each while its own success/failure counter is below 2000, and
+          one line in 100 afterwards. Successes and failures have separate counters, so a
+          flood of successful opens can never hide a failure; and the summary line prints
+          the exact totals, so a sampled-away event is still counted. The budget is
+          needed because the observed logs contain real per-frame loops (14,420 identical
+          `Unhandled CFStringEncoding 0x940` warnings in one v4 run), and unbudgeted
+          logging would grow the log by megabytes for no extra information.
+
+          Usage: python3 patch_fsinstrument_v6.py [repo-root]   (default: current directory)
+
+          The script applies the edits by exact text replacement, refuses to run unless
+          every anchor matches the expected number of times, skips edits that are already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          LIB_RS = "src/lib.rs"
+          FS_TRACE = "src/fs_trace.rs"
+          FS_RS = "src/fs.rs"
+          POSIX_IO = "src/libc/posix_io.rs"
+          GLES_GUEST = "src/frameworks/opengles/gles_guest.rs"
+          EAGL = "src/frameworks/opengles/eagl.rs"
+
+          # The whole new module. Kept as one literal so the patch is a single, reviewable
+          # artifact and so "did the trace module change?" is a byte comparison.
+          FS_TRACE_RS = '''/*
+           * This Source Code Form is subject to the terms of the Mozilla Public
+           * License, v. 2.0. If a copy of the MPL was not distributed with this
+           * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+           */
+          //! Patch E (v6): tracing for guest file access and texture uploads.
+          //!
+          //! This module answers the question the v5 core could not: what does the app
+          //! under test actually read, and what does it upload to the GPU? The v5 log
+          //! showed a black screen with a single `First glTexImage2D(1x1, ...)` line,
+          //! which is the shape of "the app never managed to load its textures" but says
+          //! nothing about how many uploads there were or how big they were.
+          //!
+          //! Nothing here changes emulation behaviour. Every function only counts and
+          //! logs; the instrumentation points are
+          //!   * `crate::libc::posix_io::open_direct` - every `open()`, `creat()`,
+          //!     `fopen()`, `NSFileHandle` factory and `mmap` call;
+          //!   * `crate::fs::Fs::read` - every "read the whole guest file at once" call,
+          //!     i.e. `NSData -initWithContentsOfFile:`, `UIImage
+          //!     imageWithContentsOfFile:`, `CGDataProvider`, `NSString
+          //!     stringWithContentsOfFile:`, `NSFileManager contentsAtPath:` and friends;
+          //!   * `crate::frameworks::opengles::gles_guest` - `glTexImage2D`,
+          //!     `glCompressedTexImage2D`, `glDrawArrays`, `glDrawElements`;
+          //!   * `crate::frameworks::opengles::eagl` - one summary line every 600 guest
+          //!     frames (~10 s at 60 FPS).
+          //!
+          //! Line formats (short and greppable on purpose):
+          //!
+          //! ```text
+          //! FSOPEN ok  <guest path>
+          //! FSOPEN ERR <guest path> flags=0x<guest flags> err=guest-fs
+          //! FSREAD ok  <guest path> bytes=<byte count>
+          //! FSREAD ERR <guest path> err=guest-fs
+          //! TEXUPLOAD <w>x<h> internal=0x<hex> fmt=0x<hex> type=0x<hex> lvl=<level>
+          //! TEXUPLOAD-COMPRESSED <w>x<h> internal=0x<hex> image_size=<bytes> lvl=<level>
+          //! FS SUMMARY frames=<n> tex_uploads=<n> tex_uploads_compressed=<n>
+          //!            gl_draws=<n> opens_ok=<n> opens_err=<n> reads_ok=<n> reads_err=<n>
+          //! ```
+          //!
+          //! The guest filesystem layer reports failures as a bare `Err(())` with no
+          //! `errno`, so the traces say `err=guest-fs`: the path is not in the guest tree
+          //! (or, for a write open, the file is read-only - which the pre-existing
+          //! warning in `src/fs.rs` names in full).
+
+          use std::sync::atomic::{AtomicU32, Ordering};
+
+          /// How many lines one kind of event prints in full before the trace switches to
+          /// sampling.
+          ///
+          /// The budget needs to cover the app's whole startup burst (a few hundred file
+          /// accesses and uploads for a 2D game like this one) while staying bounded if
+          /// the app loops: the v4 log contained 14,420 identical warnings from a single
+          /// per-frame loop, and 2,000 lines of one kind is around 250 KB.
+          const TRACE_BUDGET: u32 = 2000;
+
+          /// After [TRACE_BUDGET] lines of one kind, one event in this many is printed.
+          ///
+          /// 100 keeps a running sample of what the app is doing without letting a
+          /// per-frame loop flood the log: a 36,000-event loop adds 360 lines, not
+          /// 36,000. The exact totals are in the [print_summary] line either way.
+          const TRACE_SAMPLE: u32 = 100;
+
+          /// Whether the `count`-th event of one kind (counting from zero) prints a line.
+          fn within_trace_budget(count: u32) -> bool {
+              count < TRACE_BUDGET || count % TRACE_SAMPLE == 0
+          }
+
+          /// Guest `open()` calls that succeeded / failed. See [note_open].
+          static OPENS_OK: AtomicU32 = AtomicU32::new(0);
+          static OPENS_ERR: AtomicU32 = AtomicU32::new(0);
+          /// Guest "read this whole file" calls that succeeded / failed. See [note_read].
+          static READS_OK: AtomicU32 = AtomicU32::new(0);
+          static READS_ERR: AtomicU32 = AtomicU32::new(0);
+          /// Texture uploads, uncompressed and compressed.
+          static TEX_UPLOADS: AtomicU32 = AtomicU32::new(0);
+          static COMPRESSED_TEX_UPLOADS: AtomicU32 = AtomicU32::new(0);
+          /// `glDrawArrays`/`glDrawElements` calls. See [note_draw].
+          static DRAWS: AtomicU32 = AtomicU32::new(0);
+
+          /// Traces one guest `open()`-class call, from `posix_io::open_direct`.
+          ///
+          /// `ok` is the `FileDescriptor` result (`-1` means the open failed) and `flags`
+          /// is the guest's `open()` flag word, which is worth keeping because a failed
+          /// write open (`O_WRONLY`/`O_CREAT`) and a failed read are different bugs.
+          pub fn note_open(path: &str, ok: bool, flags: i32) {
+              if ok {
+                  let n = OPENS_OK.fetch_add(1, Ordering::Relaxed);
+                  if within_trace_budget(n) {
+                      log!("FSOPEN ok  {}", path);
+                  }
+              } else {
+                  let n = OPENS_ERR.fetch_add(1, Ordering::Relaxed);
+                  if within_trace_budget(n) {
+                      log!("FSOPEN ERR {} flags={:#x} err=guest-fs", path, flags);
+                  }
+              }
+          }
+
+          /// Traces one "read the whole guest file" call, from `Fs::read`.
+          ///
+          /// `bytes` is the length of the data on success and `None` on failure, so the
+          /// trace shows both which files the app managed to load and how big they were
+          /// (a 0-byte or 100-byte "sprite" is itself a finding).
+          pub fn note_read(path: &str, bytes: Option<usize>) {
+              match bytes {
+                  Some(len) => {
+                      let n = READS_OK.fetch_add(1, Ordering::Relaxed);
+                      if within_trace_budget(n) {
+                          log!("FSREAD ok  {} bytes={}", path, len);
+                      }
+                  }
+                  None => {
+                      let n = READS_ERR.fetch_add(1, Ordering::Relaxed);
+                      if within_trace_budget(n) {
+                          log!("FSREAD ERR {} err=guest-fs", path);
+                      }
+                  }
+              }
+          }
+
+          /// Traces one `glTexImage2D` call. No pixel data is ever logged.
+          pub fn note_tex_upload(
+              width: i32,
+              height: i32,
+              internal_format: u32,
+              format: u32,
+              type_: u32,
+              level: i32,
+          ) {
+              let n = TEX_UPLOADS.fetch_add(1, Ordering::Relaxed);
+              if within_trace_budget(n) {
+                  log!(
+                      "TEXUPLOAD {}x{} internal=0x{:x} fmt=0x{:x} type=0x{:x} lvl={}",
+                      width,
+                      height,
+                      internal_format,
+                      format,
+                      type_,
+                      level
+                  );
+              }
+          }
+
+          /// Traces one `glCompressedTexImage2D` (PVRTC/PVR) call. No pixel data is ever
+          /// logged, only the declared size and the byte count the guest passed in.
+          pub fn note_compressed_tex_upload(
+              width: i32,
+              height: i32,
+              internal_format: u32,
+              image_size: i32,
+              level: i32,
+          ) {
+              let n = COMPRESSED_TEX_UPLOADS.fetch_add(1, Ordering::Relaxed);
+              if within_trace_budget(n) {
+                  log!(
+                      "TEXUPLOAD-COMPRESSED {}x{} internal=0x{:x} image_size={} lvl={}",
+                      width,
+                      height,
+                      internal_format,
+                      image_size,
+                      level
+                  );
+              }
+          }
+
+          /// Counts one `glDrawArrays`/`glDrawElements` call.
+          ///
+          /// Draws happen every frame, so they get no line of their own; the count is
+          /// reported by [print_summary].
+          pub fn note_draw() {
+              DRAWS.fetch_add(1, Ordering::Relaxed);
+          }
+
+          /// Prints one cumulative summary line, called every 600 guest frames (~10 s at
+          /// 60 FPS) from `-[EAGLContext presentRenderbuffer:]`.
+          ///
+          /// This is the line that answers "is the app actually uploading textures and
+          /// drawing?" at a glance: a frames count that keeps growing next to a texture
+          /// upload and a draw count that do not is a stalled renderer, not a black one.
+          pub fn print_summary(frames: u64) {
+              log!(
+                  "FS SUMMARY frames={} tex_uploads={} tex_uploads_compressed={} gl_draws={} opens_ok={} opens_err={} reads_ok={} reads_err={}",
+                  frames,
+                  TEX_UPLOADS.load(Ordering::Relaxed),
+                  COMPRESSED_TEX_UPLOADS.load(Ordering::Relaxed),
+                  DRAWS.load(Ordering::Relaxed),
+                  OPENS_OK.load(Ordering::Relaxed),
+                  OPENS_ERR.load(Ordering::Relaxed),
+                  READS_OK.load(Ordering::Relaxed),
+                  READS_ERR.load(Ordering::Relaxed),
+              );
+          }
+          '''
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, marker that proves the replacement landed).
+          EDITS = [
+              (
+                  "E0 lib.rs declares the tracing module",
+                  LIB_RS,
+                  """mod fs;
+          mod gdb;
+          """,
+                  """mod fs;
+          mod fs_trace;
+          mod gdb;
+          """,
+                  1,
+                  "mod fs_trace;",
+              ),
+              (
+                  "E2 open_direct traces every guest open",
+                  POSIX_IO,
+                  """    log_dbg!(
+                  "open({:?} {:?}, {:#x}) => {:?}",
+                  path,
+                  actual_path_string,
+                  flags,
+                  res
+              );
+              res
+          }
+          """,
+                  """    // Patch E (v6): the single choke point every guest open-class call
+              // passes through (`open()`, `creat()`, `fopen()`, the `NSFileHandle`
+              // factories and `mmap`). `res` is the result the emulated call is about to
+              // return, so the trace cannot change it; the debug line below is the
+              // pre-existing one and stays as it was.
+              crate::fs_trace::note_open(&actual_path_string, res != -1, flags);
+              log_dbg!(
+                  "open({:?} {:?}, {:#x}) => {:?}",
+                  path,
+                  actual_path_string,
+                  flags,
+                  res
+              );
+              res
+          }
+          """,
+                  1,
+                  "crate::fs_trace::note_open(&actual_path_string, res != -1, flags);",
+              ),
+              (
+                  "E3 Fs::read traces every whole-file read",
+                  FS_RS,
+                  """    /// Like [std::fs::read] but for the guest filesystem.
+              pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
+                  let mut file = self.open(path.as_ref())?;
+          """,
+                  """    /// Like [std::fs::read] but for the guest filesystem.
+              ///
+              /// Patch E (v6) made this a tracing wrapper around `read_inner`, which
+              /// holds the pre-patch body verbatim. This is the one guest entry point
+              /// shared by every "read the whole file at once" caller: `NSData
+              /// -initWithContentsOfFile:` (and so `dataWithContentsOfFile:` and
+              /// `contentsOfFile:`), `UIImage imageWithContentsOfFile:`, `CGDataProvider`,
+              /// `NSString stringWithContentsOfFile:`, `NSFileManager contentsAtPath:`
+              /// and the audio/plist/XML loaders. The wrapper only records what
+              /// `read_inner` returned; it returns that value unchanged.
+              pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
+                  let result = self.read_inner(path.as_ref());
+                  let bytes_read = result.as_ref().ok().map(|bytes| bytes.len());
+                  crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);
+                  result
+              }
+
+              /// The pre-patch body of [Self::read], moved here verbatim (same signature,
+              /// same statements) so that the tracing wrapper above cannot change what it
+              /// does.
+              fn read_inner<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
+                  let mut file = self.open(path.as_ref())?;
+          """,
+                  1,
+                  "crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);",
+              ),
+              (
+                  "E4 glTexImage2D traces every upload",
+                  GLES_GUEST,
+                  """        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+                  static SEEN: AtomicBool = AtomicBool::new(false);
+                  if !SEEN.swap(true, Ordering::Relaxed) {
+                      log!(
+                          "First glTexImage2D({}x{}, internalformat=0x{:x}, format=0x{:x}, type=0x{:x}) (app uploading texture data) [this log will only be shown once]",
+                          width, height, internalformat as u32, format, type_
+                      );
+                  }
+          """,
+                  """        use std::sync::atomic::{AtomicU32, Ordering};
+                  // Patch E (v6): this used to print the first upload only, which is why
+                  // a lone 1x1 upload line was the entire record of the app's texture
+                  // uploads. Every upload is traced now; the rate limit and the line
+                  // format live in src/fs_trace.rs. The POTATO trace below is untouched.
+                  crate::fs_trace::note_tex_upload(width, height, internalformat as u32, format, type_, level);
+          """,
+                  1,
+                  "crate::fs_trace::note_tex_upload(width, height, internalformat as u32, format, type_, level);",
+              ),
+              (
+                  "E5 glCompressedTexImage2D traces every upload",
+                  GLES_GUEST,
+                  """    {
+                  use std::sync::atomic::{AtomicBool, Ordering};
+                  static SEEN: AtomicBool = AtomicBool::new(false);
+                  if !SEEN.swap(true, Ordering::Relaxed) {
+                      log!(
+                          "First glCompressedTexImage2D({}x{}, internalformat=0x{:x}, image_size={}) (app uploading PVRTC/compressed texture) [this log will only be shown once]",
+                          width, height, internalformat, image_size
+                      );
+                  }
+              }
+          """,
+                  """    // Patch E (v6): same treatment as glTexImage2D above - every compressed
+              // (PVRTC/PVR) upload is traced now, because an app that only uploads
+              // compressed art would otherwise show no texture uploads at all. The
+              // pre-flight GL error drain and the checks that follow are untouched.
+              crate::fs_trace::note_compressed_tex_upload(width, height, internalformat, image_size, level);
+          """,
+                  1,
+                  "crate::fs_trace::note_compressed_tex_upload(width, height, internalformat, image_size, level);",
+              ),
+              (
+                  "E6a glDrawArrays is counted",
+                  GLES_GUEST,
+                  """            log!(
+                          "First glDrawArrays(mode=0x{:x}, first={}, count={}) (app submitting first draw) [this log will only be shown once]",
+                          mode, first, count
+                      );
+                  }
+          """,
+                  """            log!(
+                          "First glDrawArrays(mode=0x{:x}, first={}, count={}) (app submitting first draw) [this log will only be shown once]",
+                          mode, first, count
+                      );
+                  }
+
+                  // Patch E (v6): counted for the periodic FS SUMMARY line; draws happen
+                  // every frame, so they get no line of their own.
+                  crate::fs_trace::note_draw();
+          """,
+                  1,
+                  "Patch E (v6): counted for the periodic FS SUMMARY line",
+              ),
+              (
+                  "E6b glDrawElements is counted",
+                  GLES_GUEST,
+                  """            log!(
+                          "First glDrawElements(mode=0x{:x}, count={}, type=0x{:x}) (app submitting first indexed draw) [this log will only be shown once]",
+                          mode, count, type_
+                      );
+                  }
+          """,
+                  """            log!(
+                          "First glDrawElements(mode=0x{:x}, count={}, type=0x{:x}) (app submitting first indexed draw) [this log will only be shown once]",
+                          mode, count, type_
+                      );
+                  }
+
+                  // Patch E (v6): counted together with glDrawArrays, see E6a.
+                  crate::fs_trace::note_draw();
+          """,
+                  1,
+                  "Patch E (v6): counted together with glDrawArrays, see E6a",
+              ),
+              (
+                  "E7 presentRenderbuffer prints the periodic summary",
+                  EAGL,
+                  """        if matches!(n, 10 | 60 | 300 | 1800 | 3600 | 7200 | 18000 | 36000) {
+                      log!(
+                          "[EAGLContext presentRenderbuffer:] frame {} reached (render loop is alive)",
+                          n
+                      );
+                  }
+              }
+          """,
+                  """        if matches!(n, 10 | 60 | 300 | 1800 | 3600 | 7200 | 18000 | 36000) {
+                      log!(
+                          "[EAGLContext presentRenderbuffer:] frame {} reached (render loop is alive)",
+                          n
+                      );
+                  }
+
+                  // Patch E (v6): cumulative file-access / texture-upload / draw counters
+                  // every 600 guest frames (~10 s at 60 FPS). This reuses the frame
+                  // counter already in scope rather than adding one.
+                  if n % 600 == 0 {
+                      crate::fs_trace::print_summary(n);
+                  }
+              }
+          """,
+                  1,
+                  "crate::fs_trace::print_summary(n);",
+              ),
+          ]
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def balance(text):
+              return text.count("{") == text.count("}")
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              targets = sorted({edit[1] for edit in EDITS} | {FS_TRACE})
+              texts = {}
+              for target in targets:
+                  path = repo / target
+                  if path.is_file():
+                      texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                  elif target == FS_TRACE:
+                      texts[target] = None
+                  else:
+                      fail("{} does not exist".format(path))
+
+              # E1: the new module. Unlike the other files it is created rather than
+              # edited, so idempotency is "is it already there?" plus "is the existing
+              # copy one the patch can recognise?".
+              if texts[FS_TRACE] is None:
+                  if not balance(FS_TRACE_RS):
+                      fail("the trace module the script carries is brace-unbalanced")
+                  texts[FS_TRACE] = FS_TRACE_RS
+                  print("created: E1 {} ({} bytes)".format(FS_TRACE, len(FS_TRACE_RS)))
+              elif "pub fn note_open(path: &str, ok: bool, flags: i32)" in texts[FS_TRACE]:
+                  print("already applied: E1 {} (leaving the existing copy alone)".format(FS_TRACE))
+              else:
+                  fail("{} already exists but does not look like the trace module; refusing to overwrite".format(FS_TRACE))
+
+              for name, target, old, new, occurrences, marker in EDITS:
+                  text = texts[target]
+                  if marker in text:
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  if replaced.count(marker) != occurrences:
+                      fail("{}: \"{}\" landed {} time(s), expected {}".format(
+                          target, name, replaced.count(marker), occurrences))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              for name, target, _old, _new, occurrences, marker in EDITS:
+                  if texts[target].count(marker) != occurrences:
+                      fail("{}: post-condition failed for \"{}\": {} occurrence(s) of the marker, expected {}".format(
+                          target, name, texts[target].count(marker), occurrences))
+
+              for target, text in texts.items():
+                  if not balance(text):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+              # The replacements must not have touched the two pre-existing draw traces,
+              # which is the cheapest way to prove the emulation code around them did not
+              # get rewritten on the way.
+              gles = texts[GLES_GUEST]
+              for name, marker, expected in (
+                  ("E6a+E6b note_draw", "crate::fs_trace::note_draw();", 2),
+                  ("first glDrawArrays trace", "First glDrawArrays(", 1),
+                  ("first glDrawElements trace", "First glDrawElements(", 1),
+                  ("once-only glTexImage2D trace", "First glTexImage2D(", 0),
+                  ("once-only glCompressedTexImage2D trace", "First glCompressedTexImage2D(", 0),
+              ):
+                  if gles.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          GLES_GUEST, name, gles.count(marker), expected))
+              print("post-check: the two draw counters are in place, the pre-existing "
+                    "draw traces are intact and the once-only texture upload logs are gone")
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_E_PY
 
       - name: Check that the patches really landed
         run: |
           set -eu
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
-          # bundle-root resource fallback (C, v4) and the EUC-KR decoding patch (D, v5).
+          # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5) and
+          # the file-access / texture-upload tracing (E, v6).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
-          # lookup's directory/lproj, is still missing the resource-lookup fix, or still
-          # sends the app's EUC-KR text through the UTF-8 default.
+          # lookup's directory/lproj, is still missing the resource-lookup fix, still
+          # sends the app's EUC-KR text through the UTF-8 default, or still prints only
+          # the first texture upload of a run.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -1408,6 +2037,129 @@ jobs:
                 "entry, the NSStringEncoding constant and the encoding_rs codec are all in place")
           CHECK_EUCKR
 
+          echo "== patch E (v6): guest file access and texture uploads =="
+          # Every marker below is a line patch E inserts, or - for the two markers with an
+          # expected count of 0 - a pre-patch line it replaces. The counts are exact, so a
+          # duplicated or missing insertion fails the build.
+          trace=src/fs_trace.rs
+          if [ ! -f "$trace" ]; then
+            echo "::error::patch E did not create $trace"
+            exit 1
+          fi
+          check_marker "$trace" "pub fn note_open(path: &str, ok: bool, flags: i32)" 1
+          check_marker "$trace" "pub fn note_read(path: &str, bytes: Option<usize>)" 1
+          check_marker "$trace" "pub fn note_tex_upload(" 1
+          check_marker "$trace" "pub fn note_compressed_tex_upload(" 1
+          check_marker "$trace" "pub fn note_draw()" 1
+          check_marker "$trace" "pub fn print_summary(frames: u64)" 1
+          check_marker "$trace" "FSOPEN ok  {}" 1
+          check_marker "$trace" "FSOPEN ERR {} flags={:#x} err=guest-fs" 1
+          check_marker "$trace" "FSREAD ok  {} bytes={}" 1
+          check_marker "$trace" "FSREAD ERR {} err=guest-fs" 1
+          check_marker "$trace" "TEXUPLOAD {}x{} internal=0x{:x} fmt=0x{:x} type=0x{:x} lvl={}" 1
+          check_marker "$trace" "TEXUPLOAD-COMPRESSED {}x{} internal=0x{:x} image_size={} lvl={}" 1
+          check_marker "$trace" "FS SUMMARY frames={} tex_uploads={} tex_uploads_compressed={} gl_draws={} opens_ok={} opens_err={} reads_ok={} reads_err={}" 1
+          check_marker "$trace" "const TRACE_BUDGET: u32 = 2000;" 1
+          check_marker "$trace" "const TRACE_SAMPLE: u32 = 100;" 1
+
+          check_marker src/lib.rs "mod fs_trace;" 1
+          check_marker src/libc/posix_io.rs "crate::fs_trace::note_open(&actual_path_string, res != -1, flags);" 1
+          check_marker src/fs.rs "let bytes_read = result.as_ref().ok().map(|bytes| bytes.len());" 1
+          check_marker src/fs.rs "crate::fs_trace::note_read(path.as_ref().as_str(), bytes_read);" 1
+          check_marker src/fs.rs "fn read_inner<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {" 1
+          check_marker src/frameworks/opengles/gles_guest.rs "crate::fs_trace::note_tex_upload(width, height, internalformat as u32, format, type_, level);" 1
+          check_marker src/frameworks/opengles/gles_guest.rs "crate::fs_trace::note_compressed_tex_upload(width, height, internalformat, image_size, level);" 1
+          check_marker src/frameworks/opengles/gles_guest.rs "crate::fs_trace::note_draw();" 2
+          check_marker src/frameworks/opengles/eagl.rs "crate::fs_trace::print_summary(n);" 1
+          # The once-only texture upload logs are exactly what patch E replaces; both must
+          # be gone, while the pre-existing draw traces (which patch E only counts beside)
+          # must survive untouched.
+          check_marker src/frameworks/opengles/gles_guest.rs "First glTexImage2D(" 0
+          check_marker src/frameworks/opengles/gles_guest.rs "First glCompressedTexImage2D(" 0
+          check_marker src/frameworks/opengles/gles_guest.rs "First glDrawArrays(" 1
+          check_marker src/frameworks/opengles/gles_guest.rs "First glDrawElements(" 1
+
+          python3 - <<'CHECK_FSTRACE'
+          import pathlib
+          import sys
+
+          # Structural checks a substring count cannot make: each trace call has to sit
+          # where it can only observe the emulated result, the moved Fs::read body has to
+          # be intact, and the trace module itself has to be incapable of changing
+          # emulation (no unsafe, nothing that panics, no I/O of its own).
+          problems = []
+
+          trace = pathlib.Path("src/fs_trace.rs").read_text(encoding="utf-8")
+          posix = pathlib.Path("src/libc/posix_io.rs").read_text(encoding="utf-8")
+          fs = pathlib.Path("src/fs.rs").read_text(encoding="utf-8")
+          gles = pathlib.Path("src/frameworks/opengles/gles_guest.rs").read_text(encoding="utf-8")
+          eagl = pathlib.Path("src/frameworks/opengles/eagl.rs").read_text(encoding="utf-8")
+
+          for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
+                      "std::process", "std::fs::"):
+              if bad in trace:
+                  problems.append("src/fs_trace.rs: contains {!r}, which instrumentation must not use".format(bad))
+
+          # note_open must sit after the open's result exists and before that result is
+          # returned, so it can neither replace nor influence it.
+          call = "crate::fs_trace::note_open(&actual_path_string, res != -1, flags);"
+          body = posix[posix.index("pub fn open_direct("):]
+          body = body[:body.index("\npub fn read(")]
+          try:
+              if not body.index("let res = match env") < body.index(call) < body.rindex("    res\n"):
+                  problems.append("src/libc/posix_io.rs: note_open is not between the open and the return of `res`")
+          except ValueError as error:
+              problems.append("src/libc/posix_io.rs: {}".format(error))
+
+          # Fs::read must still be a pass-through wrapper around read_inner, and
+          # read_inner must still contain the pre-patch body line by line.
+          wrapper = fs[fs.index("pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {"):]
+          wrapper = wrapper[:wrapper.index("\n    fn read_inner")]
+          if "self.read_inner(path.as_ref())" not in wrapper or "\n        result\n" not in wrapper:
+              problems.append("src/fs.rs: Fs::read is no longer a pass-through wrapper")
+          inner = fs[fs.index("fn read_inner<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {"):]
+          inner = inner[:inner.index("\n    }")]
+          for line in ("        let mut file = self.open(path.as_ref())?;",
+                       "        let mut result = Vec::new();",
+                       "        file.read_to_end(&mut result).map_err(|_| ())?;",
+                       "        Ok(result)"):
+              if line not in inner:
+                  problems.append("src/fs.rs: the pre-patch body line {!r} is missing from read_inner".format(line))
+
+          # Both draw entry points must be counted.
+          arrays = gles[gles.index("fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {"):]
+          arrays = arrays[:arrays.index("\n    with_ctx_and_mem")]
+          if "crate::fs_trace::note_draw();" not in arrays:
+              problems.append("gles_guest.rs: glDrawArrays is not counted")
+          elements = gles[gles.index("fn glDrawElements(\n"):]
+          if "crate::fs_trace::note_draw();" not in elements:
+              problems.append("gles_guest.rs: glDrawElements is not counted")
+
+          # The summary has to be inside presentRenderbuffer, next to the frame counter
+          # that already exists there.
+          present = eagl[eagl.index("- (bool)presentRenderbuffer:(NSUInteger)target {"):]
+          present = present[:present.index("\n    assert!(target == gles11::RENDERBUFFER_OES);")]
+          for needed in ("static FRAME_COUNTER: AtomicU64", "if n % 600 == 0 {",
+                         "crate::fs_trace::print_summary(n);"):
+              if needed not in present:
+                  problems.append("eagl.rs: {!r} is not in presentRenderbuffer".format(needed))
+
+          for name in ("src/lib.rs", "src/libc/posix_io.rs", "src/fs.rs",
+                       "src/frameworks/opengles/gles_guest.rs",
+                       "src/frameworks/opengles/eagl.rs", "src/fs_trace.rs"):
+              content = pathlib.Path(name).read_text(encoding="utf-8")
+              if content.count("{") != content.count("}"):
+                  problems.append("{}: braces are unbalanced".format(name))
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch E: the trace module, both file-access hooks, the texture/draw "
+                "counters and the periodic summary are in place, and every traced code "
+                "path can only be observed, never changed")
+          CHECK_FSTRACE
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -1496,7 +2248,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v5
+          name: hyperhle-core-ios-arm64-v6
           path: dist/*
           if-no-files-found: error
           retention-days: 30
