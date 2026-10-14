@@ -7,14 +7,14 @@
 # Artifacts section at the bottom of the run page.
 #
 # Nothing needs to be forked. The job checks out the upstream Applesauce
-# repository at a fixed commit on the runner itself, applies three patches,
+# repository at a fixed commit on the runner itself, applies four patches,
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v4 variant of build-core.yml (v1). build-core-v2.yml added the
+# This is the v5 variant of build-core.yml (v1). build-core-v2.yml added the
 # logging; v3 added the first patch that fixes a bug instead of instrumenting
-# one; v4 corrects that patch and adds two fields to the log it was hidden
-# behind:
+# one; v4 corrected that patch and added two fields to the log it was hidden
+# behind; v5 makes the emulator decode EUC-KR, the encoding the app asks for:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -32,8 +32,19 @@
 #     lproj and directory, the only combination that reaches the plain
 #     <bundle>/<name> path, and logs the directory and lproj of every failed
 #     lookup so the two components can no longer be confused.
-# The artifact is named hyperhle-core-ios-arm64-v4 so it cannot be mistaken for
-# the v1, v2 or v3 dylib.
+#   patch D (new in v5) teaches the core the one encoding the app under test
+#     keeps asking for and touchHLE did not implement: EUC-KR. A v4 run printed
+#     14,420 "Unhandled CFStringEncoding 0x940" warnings (9,349 of them in a
+#     row, and nothing else) while the game sat at 26% of its loading bar.
+#     0x940 is kCFStringEncodingEUC_KR, so the app's Korean text tables fell
+#     through to the UTF-8 default, the game read mojibake, and the loop that
+#     waits for the tables never finished. Patch D maps both spellings of that
+#     CFStringEncoding (0x940 and 0x80000940) to one NSStringEncoding and
+#     decodes it with encoding_rs::EUC_KR, which is already a dependency of the
+#     crate; it leaves the unsupported-encoding fallback in place for every
+#     other encoding.
+# The artifact is named hyperhle-core-ios-arm64-v5 so it cannot be mistaken for
+# the v1, v2, v3 or v4 dylib.
 
 name: Build iOS emulator core (dylib)
 
@@ -119,7 +130,8 @@ jobs:
           echo "ninja:  $(ninja --version)"
           echo "python: $(python3 --version)"
 
-      - name: Patch in the missing CoreFoundation API and the logging instrumentation
+      - name: Patch in the missing CoreFoundation API, the logging instrumentation,
+             the bundle-root fallback and the EUC-KR decoding
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -883,15 +895,275 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_C_PY
+          python3 - <<'PATCH_D_PY'
+          #!/usr/bin/env python3
+          """EUC-KR decoding (patch D, v5) for the Applesauce iOS core.
+
+          Counterpart of patch_cf_url.py (patch A), patch_logging_v2.py (patch B) and
+          patch_ns_bundle_root_fallback_v4.py (patch C). Like patches A and C this one
+          changes behaviour; unlike them it does not add an API or a fallback, it makes an
+          already-present code path handle one more encoding.
+
+          What it fixes
+          -------------
+          On a real device the v4 core printed 14,420 lines of
+
+              touchHLE::frameworks::core_foundation::cf_string: Warning: Unhandled
+              CFStringEncoding 0x940, defaulting to UTF-8
+
+          in a single run (9,349 of them consecutively; the whole log is 14,754 lines), and
+          nothing else while the game sat at 26% of its loading bar. `0x940` is
+          `kCFStringEncodingEUC_KR` as Apple's CFStringEncodingExt.h defines it
+          ("ISO 646, KS C 5601-1987"), so the app is asking the emulator to decode its
+          Korean text tables as EUC-KR. touchHLE had no EUC-KR anywhere: the encoding fell
+          through the `_ =>` arm of `CFStringConvertEncodingToNSStringEncoding`, which
+          reports the warning above and returns `NSUTF8StringEncoding`. The game then read
+          mojibake, its loading loop never satisfied its exit condition, and the progress
+          bar stopped.
+
+          What it changes
+          ---------------
+          In `src/frameworks/core_foundation/cf_string.rs`:
+
+            D1  the encoding constant block gains `kCFStringEncodingEUC_KR` (0x940, the
+                value Apple documents and the value the device log shows) and
+                `kCFStringEncodingEUC_KR_HighBit` (0x80000940, the same encoding with the
+                0x80000000 bit set);
+            D2  `CFStringConvertEncodingToNSStringEncoding` maps both spellings to the new
+                `ns_string::NSKoreanEUCStringEncoding` instead of falling through to the
+                UTF-8 default;
+            D3  `CFStringConvertNSStringEncodingToEncoding` maps it back to
+                `kCFStringEncodingEUC_KR`;
+            D4  `CFStringIsEncodingAvailable` answers true for both spellings.
+
+          In `src/frameworks/foundation/ns_string.rs`:
+
+            D5  `NSKoreanEUCStringEncoding` (0x80000940) is defined next to the other
+                `NSStringEncoding` constants;
+            D6  `encoding_rs_for` maps it to `encoding_rs::EUC_KR`. That helper is the
+                single place both byte-decoding (`StringHostObject::decode`) and
+                byte-encoding (`encode_string`) reach for a codec, so one arm covers
+                `initWithBytes:length:encoding:`, `dataUsingEncoding:`,
+                `cStringUsingEncoding:` and the CoreFoundation entry points that go
+                through them (`CFStringCreateWithBytes`, `CFStringGetCString`,
+                `CFStringGetBytes`, ...). `encoding_rs` already decodes lossily with U+FFFD
+                for invalid sequences, which is what the neighbouring codecs in that match
+                do;
+            D7  `C_STRING_FRIENDLY_ENCODINGS` gains it too: EUC-KR is ASCII-compatible, so
+                it never puts a NUL byte in the middle of ASCII content, which is the
+                property that list documents (EUC-JP, Shift-JIS and the Windows code pages
+                are already there). Without D7 `-initWithCString:encoding:` would decode
+                EUC-KR correctly but warn that the encoding is not C-string friendly.
+
+          The `_ =>` arm of `CFStringConvertEncodingToNSStringEncoding` and its warning
+          are deliberately left in place: other unhandled encodings still need them, and
+          0x940 simply stops reaching the arm once D2 is in.
+
+          `encoding_rs` needs no manifest change: it is already a direct dependency of the
+          touchHLE crate (`encoding_rs = "0.8.35"` in the workspace root Cargo.toml) and is
+          already used by `ns_string.rs` for SHIFT_JIS, EUC_JP, ISO-2022-JP and the Windows
+          code pages. Cargo.lock pins 0.8.35.
+
+          Usage: python3 patch_euckr_v5.py [repo-root]        (default: current directory)
+
+          The script applies the edits by exact text replacement, refuses to run unless
+          every anchor matches the expected number of times, skips edits that are already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          CF_STRING = "src/frameworks/core_foundation/cf_string.rs"
+          NS_STRING = "src/frameworks/foundation/ns_string.rs"
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, marker that proves the replacement landed).
+          EDITS = [
+              (
+                  "D1 cf_string defines the two EUC-KR spellings",
+                  CF_STRING,
+                  """pub const kCFStringEncodingUTF32LE: CFStringEncoding = 0x1c000100;
+
+          // String normalization forms
+          """,
+                  """pub const kCFStringEncodingUTF32LE: CFStringEncoding = 0x1c000100;
+          // EUC-KR. Apple's CFStringEncodingExt.h defines this as 0x0940 ("ISO 646,
+          // KS C 5601-1987"), and 0x940 is what the app under test asks for: the device
+          // log's repeated "Unhandled CFStringEncoding 0x940" warnings are this encoding
+          // reaching the UTF-8 default, not an unknown one. `kCFStringEncodingEUC_KR_HighBit`
+          // is the same encoding with the 0x80000000 bit set; both spellings are accepted
+          // below so neither can fall through.
+          pub const kCFStringEncodingEUC_KR: CFStringEncoding = 0x940;
+          pub const kCFStringEncodingEUC_KR_HighBit: CFStringEncoding = 0x80000940;
+
+          // String normalization forms
+          """,
+                  1,
+                  "pub const kCFStringEncodingEUC_KR: CFStringEncoding = 0x940;",
+              ),
+              (
+                  "D2 cf_string maps EUC-KR to an NSString encoding",
+                  CF_STRING,
+                  """        kCFStringEncodingWindowsLatin1 => ns_string::NSWindowsCP1252StringEncoding,
+          """,
+                  """        kCFStringEncodingWindowsLatin1 => ns_string::NSWindowsCP1252StringEncoding,
+                  // EUC-KR, the Korean text tables this app loads. Both spellings of the
+                  // CFStringEncoding resolve to the one NSStringEncoding below.
+                  kCFStringEncodingEUC_KR => ns_string::NSKoreanEUCStringEncoding,
+                  kCFStringEncodingEUC_KR_HighBit => ns_string::NSKoreanEUCStringEncoding,
+          """,
+                  1,
+                  "kCFStringEncodingEUC_KR => ns_string::NSKoreanEUCStringEncoding,",
+              ),
+              (
+                  "D3 cf_string maps the NSString encoding back to EUC-KR",
+                  CF_STRING,
+                  """        ns_string::NSWindowsCP1252StringEncoding => kCFStringEncodingWindowsLatin1,
+          """,
+                  """        ns_string::NSWindowsCP1252StringEncoding => kCFStringEncodingWindowsLatin1,
+                  ns_string::NSKoreanEUCStringEncoding => kCFStringEncodingEUC_KR,
+          """,
+                  1,
+                  "ns_string::NSKoreanEUCStringEncoding => kCFStringEncodingEUC_KR,",
+              ),
+              (
+                  "D4 cf_string reports EUC-KR as available",
+                  CF_STRING,
+                  """            | kCFStringEncodingUTF32LE
+                      | kCFStringEncodingNextStepLatin
+              )
+          """,
+                  """            | kCFStringEncodingUTF32LE
+                      | kCFStringEncodingNextStepLatin
+                      | kCFStringEncodingEUC_KR
+                      | kCFStringEncodingEUC_KR_HighBit
+              )
+          """,
+                  1,
+                  "            | kCFStringEncodingEUC_KR\n            | kCFStringEncodingEUC_KR_HighBit",
+              ),
+              (
+                  "D5 ns_string defines NSKoreanEUCStringEncoding",
+                  NS_STRING,
+                  """pub const NSUTF32BigEndianStringEncoding: NSUInteger = 0x98000100;
+          """,
+                  """pub const NSUTF32BigEndianStringEncoding: NSUInteger = 0x98000100;
+          /// EUC-KR (`kCFStringEncodingEUC_KR` = 0x940) as an `NSStringEncoding`.
+          ///
+          /// Current Foundation headers name no Korean encoding; NSString.h states that
+          /// `NSStringEncoding` supports the encodings of CFStringEncodingExt.h, and this
+          /// is that encoding's spelling here: 0x940 with the 0x80000000 marker bit the
+          /// extended encodings above already carry (0x8c000100, 0x90000100, 0x94000100,
+          /// 0x98000100, 0x9c000100). That also keeps it clear of every constant in the
+          /// deprecated small range (1..=30) and of the 0x?000100 Unicode forms. The value
+          /// is internal to this crate: `cf_string`'s two conversion functions are its only
+          /// users, together with `C_STRING_FRIENDLY_ENCODINGS` above and
+          /// `encoding_rs_for` below, and both spellings of the `CFStringEncoding` map
+          /// onto it.
+          pub const NSKoreanEUCStringEncoding: NSUInteger = 0x80000940;
+          """,
+                  1,
+                  "pub const NSKoreanEUCStringEncoding: NSUInteger = 0x80000940;",
+              ),
+              (
+                  "D6 ns_string decodes EUC-KR with encoding_rs",
+                  NS_STRING,
+                  """        NSWindowsCP1254StringEncoding => encoding_rs::WINDOWS_1254,
+          """,
+                  """        NSWindowsCP1254StringEncoding => encoding_rs::WINDOWS_1254,
+                  // The Korean text tables the app loads; lossy U+FFFD substitution for
+                  // invalid sequences, as for the codecs above.
+                  NSKoreanEUCStringEncoding => encoding_rs::EUC_KR,
+          """,
+                  1,
+                  "NSKoreanEUCStringEncoding => encoding_rs::EUC_KR,",
+              ),
+              (
+                  "D7 ns_string treats EUC-KR as C-string friendly",
+                  NS_STRING,
+                  """    NSShiftJISStringEncoding,
+              NSJapaneseEUCStringEncoding,
+          """,
+                  """    NSShiftJISStringEncoding,
+              NSJapaneseEUCStringEncoding,
+              NSKoreanEUCStringEncoding,
+          """,
+                  1,
+                  """    NSJapaneseEUCStringEncoding,
+              NSKoreanEUCStringEncoding,
+          """,
+              ),
+          ]
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              texts = {}
+              for target in sorted({edit[1] for edit in EDITS}):
+                  path = repo / target
+                  if not path.is_file():
+                      fail("{} does not exist".format(path))
+                  texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+              for name, target, old, new, occurrences, marker in EDITS:
+                  text = texts[target]
+                  if marker in text:
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  if replaced.count(marker) != occurrences:
+                      fail("{}: \"{}\" landed {} time(s), expected {}".format(
+                          target, name, replaced.count(marker), occurrences))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              for name, target, _old, _new, occurrences, marker in EDITS:
+                  if texts[target].count(marker) != occurrences:
+                      fail("{}: post-condition failed for \"{}\": {} occurrence(s) of the marker, expected {}".format(
+                          target, name, texts[target].count(marker), occurrences))
+
+              for target, text in texts.items():
+                  if text.count("{") != text.count("}"):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_D_PY
 
       - name: Check that the patches really landed
         run: |
           set -eu
-          # Self-check for the CoreFoundation patch (A), the logging patches (B) and the
-          # bundle-root resource fallback (C, v4). Run from the root of the checkout. Fails
-          # the build if any of them did not land, so a run can never upload a dylib that
-          # still logs the old way, still hides the lookup's directory/lproj, or is still
-          # missing the resource-lookup fix.
+          # Self-check for the CoreFoundation patch (A), the logging patches (B), the
+          # bundle-root resource fallback (C, v4) and the EUC-KR decoding patch (D, v5).
+          # Run from the root of the checkout. Fails the build if any of them did not land,
+          # so a run can never upload a dylib that still logs the old way, still hides the
+          # lookup's directory/lproj, is still missing the resource-lookup fix, or still
+          # sends the app's EUC-KR text through the UTF-8 default.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -1010,6 +1282,132 @@ jobs:
           print("no pre-patch log call remains and the patched files are brace-balanced")
           CHECK_OLD_LOGS
 
+          echo "== patch D (v5): EUC-KR =="
+          # Patch D gives the emulator the Korean text encoding the app asks for. Each
+          # marker below is a code line patch D inserts, with the count the patch script
+          # guarantees, so a missing or a duplicated insertion fails the build. The plain
+          # `| kCFStringEncodingEUC_KR` marker is expected twice: it is a prefix of the
+          # `_HighBit` whitelist line as well as the name of the plain one.
+          cfstring=src/frameworks/core_foundation/cf_string.rs
+          nsstring=src/frameworks/foundation/ns_string.rs
+          check_marker "$cfstring" "pub const kCFStringEncodingEUC_KR: CFStringEncoding = 0x940;" 1
+          check_marker "$cfstring" "pub const kCFStringEncodingEUC_KR_HighBit: CFStringEncoding = 0x80000940;" 1
+          check_marker "$cfstring" "kCFStringEncodingEUC_KR => ns_string::NSKoreanEUCStringEncoding," 1
+          check_marker "$cfstring" "kCFStringEncodingEUC_KR_HighBit => ns_string::NSKoreanEUCStringEncoding," 1
+          check_marker "$cfstring" "ns_string::NSKoreanEUCStringEncoding => kCFStringEncodingEUC_KR," 1
+          check_marker "$cfstring" "| kCFStringEncodingEUC_KR" 2
+          check_marker "$cfstring" "| kCFStringEncodingEUC_KR_HighBit" 1
+          # Requirement: the unsupported-encoding fallback must survive patch D. Other
+          # encodings still need it; 0x940 stops reaching it because of the arms above.
+          check_marker "$cfstring" "Warning: Unhandled CFStringEncoding {:#x}, defaulting to UTF-8" 1
+          check_marker "$nsstring" "pub const NSKoreanEUCStringEncoding: NSUInteger = 0x80000940;" 1
+          check_marker "$nsstring" "        NSKoreanEUCStringEncoding => encoding_rs::EUC_KR," 1
+
+          python3 - <<'CHECK_EUCKR'
+          import pathlib
+          import sys
+
+          # Structural checks that a substring count cannot make: every new arm has to sit
+          # inside the function it belongs to, ahead of that function's fallback, and each
+          # new definition has to exist exactly once as a whole line, so an indented copy
+          # or an extra insertion somewhere else cannot satisfy them.
+          problems = []
+
+          cf = pathlib.Path("src/frameworks/core_foundation/cf_string.rs").read_text(encoding="utf-8")
+          ns = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
+
+
+          def expect_lines(text, where, wanted):
+              lines = text.splitlines()
+              for line, count in wanted:
+                  got = lines.count(line)
+                  if got != count:
+                      problems.append("{}: {:?} appears {} time(s) as a line, expected {}".format(
+                          where, line.strip()[:70], got, count))
+
+
+          def expect_order(text, where, new_code, before, inside):
+              base = text.index(inside)
+              try:
+                  a = text.index(new_code, base)
+                  b = text.index(before, base)
+              except ValueError as error:
+                  problems.append("{}: {}".format(where, error))
+                  return
+              if not a < b:
+                  problems.append("{}: {:?} does not come before {:?}".format(
+                      where, new_code[:60], before[:60]))
+
+
+          # D1: the two spellings of the encoding, once each.
+          expect_lines(cf, "cf_string.rs D1", [
+              ("pub const kCFStringEncodingEUC_KR: CFStringEncoding = 0x940;", 1),
+              ("pub const kCFStringEncodingEUC_KR_HighBit: CFStringEncoding = 0x80000940;", 1),
+          ])
+          # D2: both spellings map to the new NSStringEncoding, inside
+          # CFStringConvertEncodingToNSStringEncoding and ahead of its UTF-8 fallback.
+          expect_lines(cf, "cf_string.rs D2", [
+              ("        kCFStringEncodingEUC_KR => ns_string::NSKoreanEUCStringEncoding,", 1),
+              ("        kCFStringEncodingEUC_KR_HighBit => ns_string::NSKoreanEUCStringEncoding,", 1),
+          ])
+          expect_order(cf, "cf_string.rs D2 (arm inside the conversion function)",
+                       "kCFStringEncodingEUC_KR => ns_string::NSKoreanEUCStringEncoding,",
+                       "Warning: Unhandled CFStringEncoding",
+                       "pub fn CFStringConvertEncodingToNSStringEncoding")
+          # D3: the reverse mapping, inside its own function.
+          expect_lines(cf, "cf_string.rs D3", [
+              ("        ns_string::NSKoreanEUCStringEncoding => kCFStringEncodingEUC_KR,", 1),
+          ])
+          expect_order(cf, "cf_string.rs D3 (arm inside the reverse function)",
+                       "ns_string::NSKoreanEUCStringEncoding => kCFStringEncodingEUC_KR,",
+                       "Warning: Unhandled NSStringEncoding",
+                       "fn CFStringConvertNSStringEncodingToEncoding")
+          # D4: both spellings answer true from CFStringIsEncodingAvailable. The body is
+          # brace-free, so the first closing brace ends the function.
+          available = cf[cf.index("fn CFStringIsEncodingAvailable"):].split("}", 1)[0].splitlines()
+          for line in ("            | kCFStringEncodingEUC_KR",
+                       "            | kCFStringEncodingEUC_KR_HighBit"):
+              if line not in available:
+                  problems.append("cf_string.rs D4: {:?} is not in CFStringIsEncodingAvailable".format(
+                      line.strip()))
+
+          # D5/D6: the constant and the codec, once each, with the codec inside
+          # encoding_rs_for - the helper both the decode and the encode path reach for -
+          # ahead of that helper's `_ => return None`.
+          expect_lines(ns, "ns_string.rs D5/D6", [
+              ("pub const NSKoreanEUCStringEncoding: NSUInteger = 0x80000940;", 1),
+              ("        NSKoreanEUCStringEncoding => encoding_rs::EUC_KR,", 1),
+          ])
+          expect_order(ns, "ns_string.rs D6 (codec inside encoding_rs_for)",
+                       "NSKoreanEUCStringEncoding => encoding_rs::EUC_KR,",
+                       "_ => return None,",
+                       "fn encoding_rs_for")
+          # D7: the C-string friendly list, a block of bare identifiers.
+          list_start = ns.index("const C_STRING_FRIENDLY_ENCODINGS")
+          list_lines = ns[list_start:ns.index("];", list_start)].splitlines()
+          korean = "    NSKoreanEUCStringEncoding,"
+          japanese = "    NSJapaneseEUCStringEncoding,"
+          if list_lines.count(korean) != 1:
+              problems.append(
+                  "ns_string.rs D7: NSKoreanEUCStringEncoding is listed {} time(s) in C_STRING_FRIENDLY_ENCODINGS, expected 1".format(
+                      list_lines.count(korean)))
+          if not any(one == japanese and two == korean for one, two in zip(list_lines, list_lines[1:])):
+              problems.append(
+                  "ns_string.rs D7: expected NSKoreanEUCStringEncoding right after NSJapaneseEUCStringEncoding")
+
+          for name in ("src/frameworks/core_foundation/cf_string.rs", "src/frameworks/foundation/ns_string.rs"):
+              content = pathlib.Path(name).read_text(encoding="utf-8")
+              if content.count("{") != content.count("}"):
+                  problems.append("{}: braces are unbalanced".format(name))
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch D: both EUC-KR spellings, the two conversion arms, the availability "
+                "entry, the NSStringEncoding constant and the encoding_rs codec are all in place")
+          CHECK_EUCKR
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -1098,7 +1496,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v4
+          name: hyperhle-core-ios-arm64-v5
           path: dist/*
           if-no-files-found: error
           retention-days: 30
