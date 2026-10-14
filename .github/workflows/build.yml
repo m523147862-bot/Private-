@@ -33,11 +33,11 @@
 # Artifacts section at the bottom of the run page.
 #
 # Nothing needs to be forked. The job checks out the upstream Applesauce
-# repository at a fixed commit on the runner itself, applies seven patches,
+# repository at a fixed commit on the runner itself, applies eight patches,
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v8 variant of build-core.yml (v1). v2 added the logging; v3 added
+# This is the v9 variant of build-core.yml (v1). v2 added the logging; v3 added
 # the first patch that fixes a bug instead of instrumenting one; v4 corrected
 # that patch and added two fields to the log it was hidden behind; v5 makes the
 # emulator decode EUC-KR, the encoding the app asks for; v6 added the
@@ -45,7 +45,9 @@
 # calls that never open a file, because the v6 device log showed a path that is
 # opened 30 times and is never a file; v8 adds the tracing of where that nil
 # path component comes from, because the v7 device log showed the mechanism but
-# not the culprit:
+# not the culprit; v9 adds the guest call stack at the point that nil is produced,
+# because the v8 log showed the single PC/return-address pair patch G recorded was
+# not a caller but a state-machine instruction and two data-table addresses:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -125,8 +127,31 @@
 #     return value and no branch, the rate limit lives in the new
 #     src/fs_origin.rs, and patch G does not edit a single line patches A-F
 #     inserted.
-# The artifact is named hyperhle-core-ios-arm64-v8 so it cannot be mistaken for
-# the v1..v7 dylibs.
+#   patch H (new in v9) is instrumentation too, and it finishes the search patch
+#     G started. The v8 device log showed that patch G's single `pc`/`ret` pair
+#     is not a caller at all: `pc` is the same `cmn r3,#2` state-machine
+#     instruction on every occurrence and `ret` disassembles to data tables. A
+#     program counter plus a link register is not a call stack, so patch H stops
+#     reading those registers and reuses the call-stack mechanism touchHLE
+#     already has for its own panic backtrace - the "Attempting to produce stack
+#     trace for current thread (#0)" output. It adds one read-only method beside
+#     that unwinder, `Environment::guest_stack_frames`, which walks the very same
+#     AAPCS frame-pointer chain (`[fp]` is the caller's frame pointer, `[fp + 4]`
+#     its return address) and returns the addresses instead of printing them, and
+#     it prints roughly twelve frames at the exact place the component is
+#     dropped: a "PATHJOIN STACK" header and one "#n 0x..." line, for the first
+#     three occurrences only. It also completes two small gaps the v8 log showed:
+#     "NSDEFAULTSSET" traces every NSUserDefaults write (setObject:forKey:,
+#     setBool:forKey:, setInteger:forKey:, removeObjectForKey:) with the key and
+#     a one-token summary of the stored value, so a later stringForKey: that
+#     answers nil can be matched against what was written; and "PATHFOUND" names
+#     every resource lookup that *succeeded* (patch B/C only named the failures),
+#     the first 40 in full and one in 100 afterwards. Like B, E, F and G it
+#     changes no return value and no branch, and it does not edit a single line
+#     patches A-G inserted - the panic backtrace and patch G's module are
+#     untouched, and the new lines go beside the existing ones.
+# The artifact is named hyperhle-core-ios-arm64-v9 so it cannot be mistaken for
+# the v1..v8 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -213,7 +238,8 @@ jobs:
 
       - name: Patch in the missing CoreFoundation API, the logging instrumentation,
              the bundle-root fallback, the EUC-KR decoding, the file/texture tracing,
-             the filesystem probe/write tracing and the path-origin tracing
+             the filesystem probe/write tracing, the path-origin tracing and the
+             nil-component stack trace
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -3759,6 +3785,622 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_G_PY
+          python3 - <<'PATCH_H_PY'
+          #!/usr/bin/env python3
+          """The guest call stack at the nil path component (patch H, v9) for the Applesauce iOS core.
+
+          Counterpart of patch_cf_url.py (patch A), patch_logging_v2.py (patch B),
+          patch_ns_bundle_root_fallback_v4.py (patch C), patch_euckr_v5.py (patch D),
+          patch_fsinstrument_v6.py (patch E), patch_fsprobe_v7.py (patch F) and
+          patch_originnil_v8.py (patch G). Like patches B, E, F and G this one is
+          instrumentation only: it adds no API, no fallback and no behaviour change, and
+          it does not edit one single line patches A-G inserted - every insertion goes
+          *beside* an existing statement. That is the property the v9 self-check
+          re-asserts.
+
+          Why patch G's pc/ret pair was replaced
+          --------------------------------------
+          Patch G recorded the guest `pc` and `ret` of the call that dropped a path
+          component. On the v8 device log both were the *same* value on every occurrence
+          (`pc=0x00167fc0`) and, disassembled, `pc` is a `cmn r3,#2` in a state handler -
+          not a call site - while `ret=0x8d13` / `0xc49f` are data tables. A single
+          program counter plus link register is not a call stack: while a host method
+          runs, those registers belong to whatever the emulator is doing, not to the
+          guest's caller chain. Patch H therefore reuses the call-stack mechanism
+          touchHLE already has for its own panic backtrace (the
+          "Attempting to produce stack trace for current thread (#0)" output) and prints
+          roughly twelve frames at the exact place the component is dropped.
+
+          What it changes
+          ---------------
+            H1  `src/environment.rs`, a new method
+                `Environment::guest_stack_frames` beside the existing
+                `Environment::stack_trace_for_thread`. It walks the very same AAPCS
+                frame-pointer chain that the panic backtrace walks (`[fp]` = caller's
+                frame pointer, `[fp + 4]` = caller's return address, starting from
+                `regs[abi::FRAME_POINTER]`), returns the addresses instead of printing
+                them, and stops at the thread's stack boundary or at touchHLE's host /
+                thread-exit routines. The existing `stack_trace_for_thread` is left byte
+                for byte as it was: it prints through `echo_no_panic!` and returns
+                nothing, so it cannot be reused without changing the panic path. This is
+                the only place a patch H edit adds to a file patch G did not create, and
+                it is read-only.
+            H2  `src/fs_origin.rs`: `note_path_component_stack` prints, for the same call
+                patch F warns about and patch G annotates, a
+                `PATHJOIN STACK base="..." component=<nil>` header followed by one line of
+                `#<n> 0x<addr>` frames from H1. The first three occurrences print; after
+                that only patch F's warning and patch G's origin line appear, so the log
+                cannot flood.
+            H3  `src/fs_origin.rs`: `note_defaults_write` is the write side of patch G's
+                `note_defaults_query`. `-[NSUserDefaults setObject:forKey:]`,
+                `setBool:forKey:`, `setInteger:forKey:` and `removeObjectForKey:` now
+                print the key and a one-token summary of the value being stored
+                (`NSDEFAULTSSET <selector> key="..." <- <summary>`), so the log shows what
+                the app had already written when a later `stringForKey:` answered nil.
+            H4  `src/fs_origin.rs`: `note_path_found` prints `PATHFOUND <path>` on every
+                successful resource return of `path_for_resource_helper`. Patch B/C only
+                named the lookups that *failed*; this names the ones that succeeded. The
+                first 40 successes print, then one in 100.
+
+          Line formats:
+
+          ```text
+          PATHJOIN STACK base="<path>" component=<nil|empty>
+          #0 0x<hex> #1 0x<hex> ... #11 0x<hex>
+          NSDEFAULTSSET <selector> key="<key>" <- <nil|str(len=N)|<class name>|removed>
+          PATHFOUND <guest path>
+          ```
+
+          Log volume and the rate limit
+          ----------------------------
+          The stack traces are the expensive line (twelve guest memory reads each) and
+          are also the rarest: the v7 log has 36 nil components in a whole run, so three
+          full traces are enough to see where the first ones come from. `PATHFOUND` is the
+          only line that can fire many times (the app looks up the same assets over and
+          over), so it gets the 40 / 100 policy the task asked for. The defaults writes
+          reuse patch G's per-`(key, value)` budget (`DEFAULTS_HEAD` / `DEFAULTS_SAMPLE`)
+          and the shared global backstop.
+
+          Usage: python3 patch_stacktrace_v9.py [repo-root]   (default: current directory)
+
+          The script applies the edits by exact text replacement, refuses to run unless
+          every anchor matches the expected number of times, skips edits that are already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          ENV_RS = "src/environment.rs"
+          FS_ORIGIN = "src/fs_origin.rs"
+          NS_STRING = "src/frameworks/foundation/ns_string.rs"
+          NS_USER_DEFAULTS = "src/frameworks/foundation/ns_user_defaults.rs"
+          NS_BUNDLE = "src/frameworks/foundation/ns_bundle.rs"
+
+
+          # H1: the guest unwinder. The walk is a copy of the loop in
+          # `stack_trace_for_thread` (it reads `[fp]` and `[fp + 4]` the same way), kept
+          # separate on purpose so that the panic path is not touched at all.
+          ENV_METHOD = '''    /// Patch H (v9): the guest return addresses of the current thread's call
+              /// stack, newest call first.
+              ///
+              /// This walks the same AAPCS frame-pointer chain that
+              /// [Self::stack_trace_for_thread] walks for the panic backtrace
+              /// ("Attempting to produce stack trace for current thread (#0)"): entry 0
+              /// is the guest program counter, entry 1 the guest link register, and each
+              /// later entry is one older frame's saved return address, read through
+              /// `[fp]` (the caller's frame pointer) and `[fp + 4]` (the caller's return
+              /// address). touchHLE maintains that chain deliberately - see
+              /// `abi::impl_CallFromHost` and its "this makes stack traces work nicely"
+              /// comment - which is why it names a caller reliably, unlike the single
+              /// `PC`/`LR` pair patch G recorded (on the v8 device those landed on a
+              /// state-machine instruction and on data tables).
+              ///
+              /// [Self::stack_trace_for_thread] itself is left byte for byte as it was:
+              /// it prints through `echo_no_panic!` and returns nothing, so reusing it
+              /// would mean changing the panic path. This method repeats that walk and
+              /// returns the addresses instead, bounded to `max` entries and stopped at
+              /// the thread's stack boundary and at touchHLE's host / thread-exit
+              /// routines. Read-only: it reads the CPU registers, guest memory and the
+              /// two dyld routine addresses, and writes only its own `Vec`.
+              pub(crate) fn guest_stack_frames(&self, max: usize) -> Vec<u32> {
+                  let mut frames = Vec::new();
+                  if self.current_thread >= self.threads.len() {
+                      return frames;
+                  }
+                  let Some(stack_range) = self.threads[self.current_thread].stack.clone() else {
+                      return frames;
+                  };
+                  let (regs, cpsr) = (*self.cpu.regs(), self.cpu.cpsr());
+                  let return_to_host_routine_addr = self.dyld.return_to_host_routine().addr_with_thumb_bit();
+                  let thread_exit_routine_addr = self.dyld.thread_exit_routine().addr_with_thumb_bit();
+
+                  // Entry 0: the program counter, with the thumb bit the panic backtrace
+                  // also prints it with.
+                  let pc_nothumb = regs[cpu::Cpu::PC];
+                  let thumb = (cpsr & cpu::Cpu::CPSR_THUMB) == cpu::Cpu::CPSR_THUMB;
+                  let pc = GuestFunction::from_addr_and_thumb_flag(pc_nothumb, thumb);
+                  frames.push(pc.addr_with_thumb_bit());
+
+                  // Entry 1: the link register, unless it is not a guest address at all.
+                  let mut lr = regs[cpu::Cpu::LR];
+                  if lr == return_to_host_routine_addr || lr == thread_exit_routine_addr {
+                      return frames;
+                  }
+                  frames.push(lr);
+
+                  // Entries 2..: the frame-pointer chain, exactly as the panic backtrace
+                  // walks it.
+                  let mut fp: mem::ConstPtr<u8> = mem::Ptr::from_bits(regs[abi::FRAME_POINTER]);
+                  while frames.len() < max {
+                      if !stack_range.contains(&fp.to_bits()) {
+                          break;
+                      }
+                      lr = self.mem.read((fp + 4).cast());
+                      fp = self.mem.read(fp.cast());
+                      if lr == return_to_host_routine_addr || lr == thread_exit_routine_addr {
+                          break;
+                      }
+                      frames.push(lr);
+                  }
+                  frames
+              }
+
+          '''
+
+
+          # H2/H3/H4: the three new line kinds, appended to patch G's module. Kept as one
+          # literal so "did the patch H section change?" is a byte comparison.
+          FS_ORIGIN_H_RS = '''
+          /// How many nil-component sites get a full stack trace before patch H goes
+          /// quiet. The two per-call lines of patch F and patch G keep printing.
+          const STACK_TRACES_MAX: u32 = 3;
+          /// Stack traces printed so far, for [note_path_component_stack]'s counter.
+          static STACK_TRACES: AtomicU32 = AtomicU32::new(0);
+
+          /// The first this many `PATHFOUND` lines print in full.
+          const FOUND_HEAD: u32 = 40;
+          /// After the head, one `PATHFOUND` line in this many.
+          const FOUND_SAMPLE: u32 = 100;
+          /// `PATHFOUND` lines printed so far, for [note_path_found]'s counter.
+          static PATH_FOUND_LINES: AtomicU32 = AtomicU32::new(0);
+
+          /// Patch H (v9): the guest call stack at the moment a nil or empty path
+          /// component is dropped.
+          ///
+          /// Printed beside patch F's `PATHJOIN WARNING` and patch G's `PATHJOIN ORIGIN`,
+          /// for the same call, when the rate limit allows it. `frames` are the guest
+          /// addresses the emulator's own `guest_stack_frames` read from the guest's
+          /// frame-pointer chain: entry 0 is the guest program counter, entry 1 the link
+          /// register / current return address, and each later entry one older return
+          /// address. Unlike patch G's single `pc`/`ret` pair - which on the v8 device
+          /// turned out to be a state-machine instruction and two data-table addresses -
+          /// this chain is the same one touchHLE's own panic backtrace walks, so entry 2
+          /// and later name the guest functions that called into
+          /// `stringByAppendingPathComponent:`. The first [STACK_TRACES_MAX] occurrences
+          /// print; after that only the two lines patch F and patch G already print
+          /// appear, so the log cannot flood.
+          pub fn note_path_component_stack(base: &str, component_is_nil: bool, frames: &[u32]) {
+              let printed = STACK_TRACES.fetch_add(1, Ordering::Relaxed);
+              if printed >= STACK_TRACES_MAX {
+                  return;
+              }
+              log!(
+                  "PATHJOIN STACK base={:?} component=<{}>",
+                  base,
+                  if component_is_nil { "nil" } else { "empty" }
+              );
+              let mut line = String::new();
+              for (index, address) in frames.iter().enumerate() {
+                  if index != 0 {
+                      line.push(' ');
+                  }
+                  let _ = std::fmt::write(&mut line, format_args!("#{} {:#010x}", index, address));
+              }
+              log!("{}", line);
+          }
+
+          /// Patch H (v9): an `NSUserDefaults` write, the write side of patch G's
+          /// [note_defaults_query].
+          ///
+          /// `selector` is the writing method, `key` the defaults key and `summary` a
+          /// one-token description of the value being stored (`str(len=N)`, a class name,
+          /// or `removed` for `removeObjectForKey:`). Patch G traced the lookups but not
+          /// the stores, so the log could not show what the app had already written when
+          /// a later `stringForKey:` answered nil. Rate limit: per `(key, value)` pair,
+          /// the same policy as the lookups (see [DEFAULTS_HEAD] and [DEFAULTS_SAMPLE]),
+          /// plus the shared global backstop.
+          pub fn note_defaults_write(selector: &str, key: &str, summary: &str) {
+              if !should_print(&["defaults-set", key, summary], DEFAULTS_HEAD, DEFAULTS_SAMPLE) {
+                  return;
+              }
+              log!("NSDEFAULTSSET {} key={:?} <- {}", selector, key, summary);
+          }
+
+          /// Patch H (v9): a resource lookup that found something.
+          ///
+          /// Printed from `path_for_resource_helper` on every path it returns non-nil
+          /// (the plain resource path, the Unity `Data` sibling, the case-insensitive
+          /// match and the empty-name shim), so the log shows which of the files the app
+          /// asked for actually exist. Patch B/C only named the lookups that *failed*.
+          /// Rate limit: the first [FOUND_HEAD] successes print in full, then one in
+          /// [FOUND_SAMPLE], because a run can look up the same asset repeatedly.
+          pub fn note_path_found(path: &str) {
+              let printed = PATH_FOUND_LINES.fetch_add(1, Ordering::Relaxed);
+              if printed >= FOUND_HEAD && printed % FOUND_SAMPLE != 0 {
+                  return;
+              }
+              log!("PATHFOUND {}", path);
+          }
+          '''
+
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, markers that prove the replacement landed).
+          EDITS = [
+              (
+                  "H1 Environment::guest_stack_frames walks the guest frame-pointer chain",
+                  ENV_RS,
+                  '''    /// Create a new thread and return its ID. The `start_routine` and
+              /// `user_data` arguments have the same meaning as the last two arguments to
+              /// `pthread_create`.
+              pub fn new_thread(
+          ''',
+                  ENV_METHOD
+                  + '''    /// Create a new thread and return its ID. The `start_routine` and
+              /// `user_data` arguments have the same meaning as the last two arguments to
+              /// `pthread_create`.
+              pub fn new_thread(
+          ''',
+                  1,
+                  ("pub(crate) fn guest_stack_frames(&self, max: usize) -> Vec<u32> {",),
+              ),
+              (
+                  "H2 the nil-component site prints the guest call stack",
+                  NS_STRING,
+                  '''        crate::fs_origin::note_path_component_origin(
+                      &base_str,
+                      component.is_null(),
+                      env.cpu.pc_with_thumb_bit().addr_with_thumb_bit(),
+                      env.cpu.regs()[crate::cpu::Cpu::LR],
+                  );
+              }
+          ''',
+                  '''        crate::fs_origin::note_path_component_origin(
+                      &base_str,
+                      component.is_null(),
+                      env.cpu.pc_with_thumb_bit().addr_with_thumb_bit(),
+                      env.cpu.regs()[crate::cpu::Cpu::LR],
+                  );
+                  // Patch H (v9): the guest call stack at this exact drop. Patch G's
+                  // `pc`/`ret` pair was the same address on every v8 device occurrence
+                  // and is not a caller, so the frames come from touchHLE's own
+                  // frame-pointer unwinder (`Environment::guest_stack_frames`, the walk
+                  // behind the "Attempting to produce stack trace" output). Three traces
+                  // print, then only patch F's warning and patch G's line. Log only: no
+                  // local is introduced and nothing here is read by a branch.
+                  crate::fs_origin::note_path_component_stack(
+                      &base_str,
+                      component.is_null(),
+                      &env.guest_stack_frames(12),
+                  );
+              }
+          ''',
+                  1,
+                  ("crate::fs_origin::note_path_component_stack(",),
+              ),
+              (
+                  "H3a setObject:forKey: logs the key and the value written",
+                  NS_USER_DEFAULTS,
+                  '''- (())setObject:(id)object forKey:(id)key { // NSString*
+              let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
+              () = msg![env; dict setObject:object forKey:key];
+          }
+          ''',
+                  '''- (())setObject:(id)object forKey:(id)key { // NSString*
+              let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
+              // Patch H (v9): the write side of patch G's NSDEFAULTS lookup trace. The
+              // key and a one-token summary of the stored value are logged before the
+              // store, so a `stringForKey:` that later answers nil can be matched against
+              // what was written. `object` is only asked for its class/length; the value
+              // that is stored is unchanged.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_write("setObject:forKey:", &key_str, &defaults_value_summary(env, object));
+              () = msg![env; dict setObject:object forKey:key];
+          }
+          ''',
+                  1,
+                  ('crate::fs_origin::note_defaults_write("setObject:forKey:", ',),
+              ),
+              (
+                  "H3b removeObjectForKey: logs the key it removes",
+                  NS_USER_DEFAULTS,
+                  '''- (())removeObjectForKey:(id)key {
+              let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
+              () = msg![env; dict removeObjectForKey:key];
+          }
+          ''',
+                  '''- (())removeObjectForKey:(id)key {
+              let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
+              // Patch H (v9): the removal half of the write side. Log only; the removal
+              // itself is the same message send as before.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_write("removeObjectForKey:", &key_str, "removed");
+              () = msg![env; dict removeObjectForKey:key];
+          }
+          ''',
+                  1,
+                  ('crate::fs_origin::note_defaults_write("removeObjectForKey:", ',),
+              ),
+              (
+                  "H3c setBool:forKey: logs the key and the value written",
+                  NS_USER_DEFAULTS,
+                  '''- (())setBool:(bool)value forKey:(id)key { // NSString *
+              let num: id = msg_class![env; NSNumber numberWithBool:value];
+              () = msg![env; this setObject:num forKey:key];
+          }
+          ''',
+                  '''- (())setBool:(bool)value forKey:(id)key { // NSString *
+              let num: id = msg_class![env; NSNumber numberWithBool:value];
+              // Patch H (v9): logged beside the NSNumber the setter builds. The setter
+              // forwards to setObject:forKey:, so a bool write prints this line and that
+              // method's line too - on purpose, so the typed wrapper and the shared path
+              // can be told apart, exactly like the getters.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_write("setBool:forKey:", &key_str, &defaults_value_summary(env, num));
+              () = msg![env; this setObject:num forKey:key];
+          }
+          ''',
+                  1,
+                  ('crate::fs_origin::note_defaults_write("setBool:forKey:", ',),
+              ),
+              (
+                  "H3d setInteger:forKey: logs the key and the value written",
+                  NS_USER_DEFAULTS,
+                  '''- (())setInteger:(NSInteger)value forKey:(id)key {
+              let num: id = msg_class![env; NSNumber numberWithInteger:value];
+              () = msg![env; this setObject:num forKey:key];
+          }
+          ''',
+                  '''- (())setInteger:(NSInteger)value forKey:(id)key {
+              let num: id = msg_class![env; NSNumber numberWithInteger:value];
+              // Patch H (v9): same as setBool:forKey: above.
+              let key_str = defaults_key_string(env, key);
+              crate::fs_origin::note_defaults_write("setInteger:forKey:", &key_str, &defaults_value_summary(env, num));
+              () = msg![env; this setObject:num forKey:key];
+          }
+          ''',
+                  1,
+                  ('crate::fs_origin::note_defaults_write("setInteger:forKey:", ',),
+              ),
+              (
+                  "H4a the empty-name shim of path_for_resource_helper reports its result",
+                  NS_BUNDLE,
+                  '''        let exec_path_str = env.bundle.executable_path().as_str().to_string();
+                  return ns_string::from_rust_string(env, exec_path_str);
+          ''',
+                  '''        let exec_path_str = env.bundle.executable_path().as_str().to_string();
+                  // Patch H (v9): the compatibility shim returns a real path, so it is a
+                  // successful resource return and is named like the others.
+                  crate::fs_origin::note_path_found(&exec_path_str);
+                  return ns_string::from_rust_string(env, exec_path_str);
+          ''',
+                  1,
+                  ("crate::fs_origin::note_path_found(&exec_path_str);",),
+              ),
+              (
+                  "H4b path_for_resource_helper reports the resource it found",
+                  NS_BUNDLE,
+                  '''    let file_exists: bool = msg![env; file_manager fileExistsAtPath:path];
+              if file_exists {
+                  return path;
+              }
+          ''',
+                  '''    let file_exists: bool = msg![env; file_manager fileExistsAtPath:path];
+              if file_exists {
+                  // Patch H (v9): the lookup succeeded. Patch B/C named only the failed
+                  // lookups, so the log never said which of the files the app asked for
+                  // actually exist and were returned. Log only; `path` is untouched.
+                  let found_str = ns_string::to_rust_string(env, path);
+                  crate::fs_origin::note_path_found(&found_str);
+                  return path;
+              }
+          ''',
+                  1,
+                  ("crate::fs_origin::note_path_found(&found_str);",),
+              ),
+              (
+                  "H4c path_for_resource_helper reports the Unity Data fallback it found",
+                  NS_BUNDLE,
+                  '''    if data_path_exists {
+                  return data_path;
+              }
+          ''',
+                  '''    if data_path_exists {
+                  // Patch H (v9): the Unity Data sibling was found, same as the plain
+                  // resource above.
+                  let found_str = ns_string::to_rust_string(env, data_path);
+                  crate::fs_origin::note_path_found(&found_str);
+                  return data_path;
+              }
+          ''',
+                  1,
+                  ("crate::fs_origin::note_path_found(&found_str);",),
+              ),
+              (
+                  "H4d path_for_resource_helper reports the case-insensitive match it found",
+                  NS_BUNDLE,
+                  '''        if let Some(full) = found {
+                      return ns_string::from_rust_string(env, full);
+                  }
+          ''',
+                  '''        if let Some(full) = found {
+                      // Patch H (v9): a case-insensitive match is a successful lookup too.
+                      crate::fs_origin::note_path_found(&full);
+                      return ns_string::from_rust_string(env, full);
+                  }
+          ''',
+                  1,
+                  ("crate::fs_origin::note_path_found(&full);",),
+              ),
+              (
+                  "H2-H4 the three new line kinds in patch G's module",
+                  FS_ORIGIN,
+                  '''    log!(
+                  "FSBYTES {} len={} hex={}",
+                  path,
+                  bytes.len(),
+                  hex_prefix(bytes, BYTES_PREFIX)
+              );
+          }
+          ''',
+                  '''    log!(
+                  "FSBYTES {} len={} hex={}",
+                  path,
+                  bytes.len(),
+                  hex_prefix(bytes, BYTES_PREFIX)
+              );
+          }
+          '''
+                  + FS_ORIGIN_H_RS,
+                  1,
+                  ("pub fn note_path_component_stack(base: &str, component_is_nil: bool, frames: &[u32]) {",),
+              ),
+          ]
+
+
+          # (file, marker, occurrences) - the exact final counts of every line patch H
+          # inserts. This is the patch-script half of the counts the v9 self-check asserts
+          # against the built tree.
+          EXACT_CHECKS = (
+              (ENV_RS, "pub(crate) fn guest_stack_frames(&self, max: usize) -> Vec<u32>", 1),
+              (FS_ORIGIN, "pub fn note_path_component_stack(base: &str, component_is_nil: bool, frames: &[u32])", 1),
+              (FS_ORIGIN, "pub fn note_defaults_write(selector: &str, key: &str, summary: &str)", 1),
+              (FS_ORIGIN, "pub fn note_path_found(path: &str)", 1),
+              (FS_ORIGIN, "PATHJOIN STACK base={:?} component=<{}>", 1),
+              (FS_ORIGIN, "NSDEFAULTSSET {} key={:?} <- {}", 1),
+              (FS_ORIGIN, "PATHFOUND {}", 1),
+              (NS_STRING, "crate::fs_origin::note_path_component_stack(", 1),
+              (NS_STRING, "&env.guest_stack_frames(12),", 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_write("setObject:forKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_write("removeObjectForKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_write("setBool:forKey:", ', 1),
+              (NS_USER_DEFAULTS, 'crate::fs_origin::note_defaults_write("setInteger:forKey:", ', 1),
+              (NS_BUNDLE, "crate::fs_origin::note_path_found(", 4),
+          )
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def balance(text):
+              return text.count("{") == text.count("}")
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              targets = sorted({edit[1] for edit in EDITS})
+              texts = {}
+              for target in targets:
+                  path = repo / target
+                  if not path.is_file():
+                      fail("{} does not exist; patch H expects a tree patches A-G already ran on".format(path))
+                  texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+              for name, target, old, new, occurrences, markers in EDITS:
+                  text = texts[target]
+                  if new in text:
+                      # The replacement text is already there, so this edit has run.
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  if old not in text:
+                      fail("{}: neither the anchor nor the replacement of \"{}\" is present; "
+                           "this is not a tree patch H recognises".format(target, name))
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  for marker in markers:
+                      if marker not in replaced:
+                          fail("{}: \"{}\" did not land ({!r} is missing)".format(target, name, marker))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              # Every line patch H inserts, with its exact final count.
+              for target, marker, expected in EXACT_CHECKS:
+                  found = texts[target].count(marker)
+                  if found != expected:
+                      fail("post-condition failed: {} contains {} occurrence(s) of {!r}, expected {}".format(
+                          target, found, marker, expected))
+
+              for target, text in texts.items():
+                  if not balance(text):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+              # Patch H must not have changed a single line patches A-G inserted. The
+              # cheapest proof is the markers the v9 self-check asserts; the load-bearing
+              # ones at the sites patch H also touches are re-checked here.
+              ns_string = texts[NS_STRING]
+              for name, marker, expected in (
+                  ("F5 path-join warning", "crate::fs_probe::note_path_component(&base_str, component.is_null());", 1),
+                  ("G2 path-join origin", "crate::fs_origin::note_path_component_origin(", 1),
+                  ("H2 path-join stack", "crate::fs_origin::note_path_component_stack(", 1),
+              ):
+                  if ns_string.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          NS_STRING, name, ns_string.count(marker), expected))
+              defaults = texts[NS_USER_DEFAULTS]
+              for selector in ("objectForKey:", "stringForKey:", "arrayForKey:",
+                               "dictionaryForKey:", "boolForKey:", "integerForKey:"):
+                  found = defaults.count('crate::fs_origin::note_defaults_query("{}", '.format(selector))
+                  if found != 1:
+                      fail("{}: patch G's {} lookup trace appears {} time(s), expected 1".format(
+                          NS_USER_DEFAULTS, selector, found))
+              environment = texts[ENV_RS]
+              for name, marker, expected in (
+                  ("the panic unwinder", "fn stack_trace_for_thread(&self, tid: usize) {", 1),
+                  ("the panic backtrace header", '"Attempting to produce stack trace for current thread (#{}):"', 1),
+                  ("patch E/F's final summary", "crate::fs_probe::print_final_summary();", 2),
+              ):
+                  if environment.count(marker) != expected:
+                      fail("{}: {} appears {} time(s), expected {}".format(
+                          ENV_RS, name, environment.count(marker), expected))
+              origin = texts[FS_ORIGIN]
+              for name, marker in (
+                  ("G2 origin line", "pub fn note_path_component_origin(base: &str, component_is_nil: bool, pc: u32, ret: u32)",),
+                  ("G3 lookup line", "pub fn note_defaults_query(selector: &str, key: &str, summary: &str)",),
+                  ("G4 read line", "pub fn note_read_file(kind: &str, path: &str, size: Option<usize>)",),
+                  ("G5 watched-file line", "pub fn note_special_file(path: &str, bytes: &[u8])",),
+              ):
+                  if origin.count(marker) != 1:
+                      fail("{}: patch G's {} appears {} time(s), expected 1".format(
+                          FS_ORIGIN, name, origin.count(marker)))
+              print("post-check: patch F's path-join warning, patch G's origin line and its six "
+                    "defaults traces, the four whole-file read lines, the watched-file dump and the "
+                    "panic unwinder are all untouched, and patch H's stack line, defaults writes and "
+                    "PATHFOUND lines are in place")
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_H_PY
 
       - name: Check that the patches really landed
         run: |
@@ -3766,15 +4408,17 @@ jobs:
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
           # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5), the
           # file-access / texture-upload tracing (E, v6), the filesystem probe / write
-          # tracing (F, v7) and the path-origin tracing (G, v8).
+          # tracing (F, v7), the path-origin tracing (G, v8) and the nil-component stack
+          # trace (H, v9).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
           # sends the app's EUC-KR text through the UTF-8 default, still prints only the
           # first texture upload of a run, still cannot show the probe and write calls
-          # that explain a path which is opened over and over but is never a file, or
-          # still cannot say which guest call produced the nil path component that turned
-          # that path into a directory.
+          # that explain a path which is opened over and over but is never a file, still
+          # cannot say which guest call produced the nil path component that turned that
+          # path into a directory, or still reports only the single PC/return-address pair
+          # that the v8 device log proved is not a caller.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -4584,6 +5228,165 @@ jobs:
                 "change, the emulated result")
           CHECK_FSORIGIN
 
+          echo "== patch H (v9): the guest call stack at the nil path component =="
+          # The three new functions, the four line formats and the rate-limit constants of
+          # patch H, plus the call site of every one of them. The counts are exact, so a
+          # duplicated or missing insertion fails the build. The A-G assertions above are
+          # unchanged: the v9 script is the v8 script with this section appended.
+          origin=src/fs_origin.rs
+          environment=src/environment.rs
+          check_marker "$environment" "pub(crate) fn guest_stack_frames(&self, max: usize) -> Vec<u32>" 1
+          check_marker "$origin" "pub fn note_path_component_stack(base: &str, component_is_nil: bool, frames: &[u32])" 1
+          check_marker "$origin" "pub fn note_defaults_write(selector: &str, key: &str, summary: &str)" 1
+          check_marker "$origin" "pub fn note_path_found(path: &str)" 1
+          check_marker "$origin" "PATHJOIN STACK base={:?} component=<{}>" 1
+          check_marker "$origin" "NSDEFAULTSSET {} key={:?} <- {}" 1
+          check_marker "$origin" "PATHFOUND {}" 1
+          check_marker "$origin" "const STACK_TRACES_MAX: u32 = 3;" 1
+          check_marker "$origin" "const FOUND_HEAD: u32 = 40;" 1
+          check_marker "$origin" "const FOUND_SAMPLE: u32 = 100;" 1
+          # Wiring: every new function has a real call site, the stack comes from the
+          # environment's own unwinder, and patch H adds its lines to patch G's module
+          # without reaching into patch F's.
+          check_marker src/frameworks/foundation/ns_string.rs "crate::fs_origin::note_path_component_stack(" 1
+          check_marker src/frameworks/foundation/ns_string.rs "&env.guest_stack_frames(12)," 1
+          defaults=src/frameworks/foundation/ns_user_defaults.rs
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_write("setObject:forKey:", ' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_write("removeObjectForKey:", ' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_write("setBool:forKey:", ' 1
+          check_marker "$defaults" 'crate::fs_origin::note_defaults_write("setInteger:forKey:", ' 1
+          check_marker src/frameworks/foundation/ns_bundle.rs "crate::fs_origin::note_path_found(" 4
+          # The mechanism patch H reuses must still be there: patch H leaves the panic
+          # backtrace alone and adds nothing to patch F's module.
+          check_marker "$environment" "fn stack_trace_for_thread(&self, tid: usize) {" 1
+          check_marker "$environment" '"Attempting to produce stack trace for current thread (#{}):"' 1
+          check_marker "$origin" "fs_probe" 0
+
+          python3 - <<'CHECK_FSSTACK'
+          import pathlib
+          import sys
+
+          # The checks a substring count cannot make: the stack line has to sit at the
+          # shared path-join site, after patch F's warning and patch G's origin line and
+          # before the path is built; the frames have to come from the environment's own
+          # frame-pointer unwinder (the same walk the panic backtrace uses), which must be
+          # left intact; the defaults writes have to describe the value they store; the
+          # PATHFOUND calls have to sit on the helper's successful returns; and patch G's
+          # module must stay unable to change emulation.
+          problems = []
+
+          origin = pathlib.Path("src/fs_origin.rs").read_text(encoding="utf-8")
+          env_rs = pathlib.Path("src/environment.rs").read_text(encoding="utf-8")
+          nsstr = pathlib.Path("src/frameworks/foundation/ns_string.rs").read_text(encoding="utf-8")
+          defaults = pathlib.Path("src/frameworks/foundation/ns_user_defaults.rs").read_text(encoding="utf-8")
+          bundle = pathlib.Path("src/frameworks/foundation/ns_bundle.rs").read_text(encoding="utf-8")
+
+          # H2/H3/H4: the module is (still) a pure logger, and it does not reach into
+          # patch F's module.
+          for bad in ("unsafe", "unwrap(", "expect(", "panic!", "todo!", "unimplemented!",
+                      "std::process::", "std::fs::", "Environment", "env.", "fs_probe"):
+              if bad in origin:
+                  problems.append("src/fs_origin.rs: contains {!r}, which instrumentation must not use".format(bad))
+
+          # H2: the stack line sits between patch G's origin line and the call that drops
+          # the component, and it is fed from the environment unwinder.
+          marker_warning = "crate::fs_probe::note_path_component(&base_str, component.is_null());"
+          marker_origin = "crate::fs_origin::note_path_component_origin("
+          marker_stack = "crate::fs_origin::note_path_component_stack("
+          marker_build = "let res = path_algorithms::string_by_appending_path_component"
+          append_impl = nsstr[nsstr.index("- (id)stringByAppendingPathComponent:(id)component {"):]
+          append_impl = append_impl[:append_impl.index("\n}")]
+          for needed in ("if component.is_null() || component_str.is_empty() {", marker_warning,
+                         marker_origin, marker_stack, "&env.guest_stack_frames(12),", marker_build):
+              if needed not in append_impl:
+                  problems.append("src/frameworks/foundation/ns_string.rs: {!r} is not in stringByAppendingPathComponent:".format(needed))
+          if all(needed in append_impl for needed in (marker_warning, marker_origin, marker_stack, marker_build)):
+              if not append_impl.index(marker_warning) < append_impl.index(marker_origin) \
+                      < append_impl.index(marker_stack) < append_impl.index(marker_build):
+                  problems.append("src/frameworks/foundation/ns_string.rs: the stack line is not between patch G's "
+                                  "origin line and the call that drops the component")
+
+          # H1: the unwinder is the frame-pointer walk the panic backtrace uses, and the
+          # panic backtrace itself is untouched.
+          unwinder = env_rs[env_rs.index("pub(crate) fn guest_stack_frames(&self, max: usize) -> Vec<u32> {"):]
+          unwinder = unwinder[:unwinder.index("\n    }")]
+          for needed in ("self.threads[self.current_thread].stack.clone()",
+                         "mem::Ptr::from_bits(regs[abi::FRAME_POINTER])",
+                         "if !stack_range.contains(&fp.to_bits()) {",
+                         "lr = self.mem.read((fp + 4).cast());",
+                         "fp = self.mem.read(fp.cast());",
+                         "self.dyld.return_to_host_routine()",
+                         "self.dyld.thread_exit_routine()",
+                         "frames.push(lr);"):
+              if needed not in unwinder:
+                  problems.append("src/environment.rs: guest_stack_frames is missing {!r}".format(needed))
+          panic_walk = env_rs[env_rs.index("fn stack_trace_for_thread(&self, tid: usize) {"):]
+          panic_walk = panic_walk[:panic_walk.index("\n    }")]
+          for needed in ("lr = self.mem.read((fp + 4).cast());",
+                         "fp = self.mem.read(fp.cast());",
+                         'echo_no_panic!(" 0. {:#x} (PC)", pc.addr_with_thumb_bit());'):
+              if needed not in panic_walk:
+                  problems.append("src/environment.rs: the panic backtrace lost {!r}".format(needed))
+          if "guest_stack_frames" in panic_walk:
+              problems.append("src/environment.rs: patch H changed the panic backtrace")
+
+          # H3: each defaults write describes the value it is about to store.
+          for head, selector, value in (
+              ("- (())setObject:(id)object forKey:(id)key { // NSString*", "setObject:forKey:", "defaults_value_summary(env, object)"),
+              ("- (())removeObjectForKey:(id)key {", "removeObjectForKey:", '"removed"'),
+              ("- (())setBool:(bool)value forKey:(id)key { // NSString *", "setBool:forKey:", "defaults_value_summary(env, num)"),
+              ("- (())setInteger:(NSInteger)value forKey:(id)key {", "setInteger:forKey:", "defaults_value_summary(env, num)"),
+          ):
+              call = 'crate::fs_origin::note_defaults_write("{}", '.format(selector)
+              if head not in defaults:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} is missing".format(selector))
+                  continue
+              body = defaults[defaults.index(head):]
+              body = body[:body.index("\n}")]
+              if call not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} has no write trace".format(selector))
+                  continue
+              if value not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not summarise the value".format(selector))
+              if "let key_str = defaults_key_string(env, key);" not in body:
+                  problems.append("src/frameworks/foundation/ns_user_defaults.rs: {} does not use the guarded key helper".format(selector))
+
+          # H4: every successful return of path_for_resource_helper names the path, and
+          # each PATHFOUND call stands in front of the return it reports.
+          helper = bundle[bundle.index("fn path_for_resource_helper("):]
+          for call, ret in (("crate::fs_origin::note_path_found(&exec_path_str);", "return ns_string::from_rust_string(env, exec_path_str);"),
+                            ("crate::fs_origin::note_path_found(&found_str);", "return path;"),
+                            ("crate::fs_origin::note_path_found(&found_str);", "return data_path;"),
+                            ("crate::fs_origin::note_path_found(&full);", "return ns_string::from_rust_string(env, full);")):
+              if call not in helper:
+                  problems.append("src/frameworks/foundation/ns_bundle.rs: path_for_resource_helper has no {!r}".format(call))
+                  continue
+              if ret not in helper:
+                  problems.append("src/frameworks/foundation/ns_bundle.rs: the return {!r} is gone".format(ret))
+                  continue
+              if helper.index(call) > helper.index(ret):
+                  problems.append("src/frameworks/foundation/ns_bundle.rs: {!r} follows its return".format(call))
+
+          for name in ("src/environment.rs", "src/fs_origin.rs",
+                       "src/frameworks/foundation/ns_string.rs",
+                       "src/frameworks/foundation/ns_user_defaults.rs",
+                       "src/frameworks/foundation/ns_bundle.rs"):
+              content = pathlib.Path(name).read_text(encoding="utf-8")
+              if content.count("{") != content.count("}"):
+                  problems.append("{}: braces are unbalanced".format(name))
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch H: the stack line (fed by the environment's own frame-pointer unwinder, the "
+                "walk behind the panic backtrace) sits at the nil-component site after patch F's "
+                "warning and patch G's origin line and before the path is built; the four defaults "
+                "writes describe the value they store; every successful resource return of "
+                "path_for_resource_helper is named; the panic backtrace is untouched; and patch G's "
+                "module stays a pure logger that does not touch patch F's module")
+          CHECK_FSSTACK
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -4672,7 +5475,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v8
+          name: hyperhle-core-ios-arm64-v9
           path: dist/*
           if-no-files-found: error
           retention-days: 30
