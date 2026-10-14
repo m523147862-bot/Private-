@@ -33,11 +33,11 @@
 # Artifacts section at the bottom of the run page.
 #
 # Nothing needs to be forked. The job checks out the upstream Applesauce
-# repository at a fixed commit on the runner itself, applies eight patches,
+# repository at a fixed commit on the runner itself, applies nine patches,
 # builds the core, verifies the result and uploads it. This file is the only
 # file the account running it needs.
 #
-# This is the v9 variant of build-core.yml (v1). v2 added the logging; v3 added
+# This is the v10 variant of build-core.yml (v1). v2 added the logging; v3 added
 # the first patch that fixes a bug instead of instrumenting one; v4 corrected
 # that patch and added two fields to the log it was hidden behind; v5 makes the
 # emulator decode EUC-KR, the encoding the app asks for; v6 added the
@@ -47,7 +47,10 @@
 # path component comes from, because the v7 device log showed the mechanism but
 # not the culprit; v9 adds the guest call stack at the point that nil is produced,
 # because the v8 log showed the single PC/return-address pair patch G recorded was
-# not a caller but a state-machine instruction and two data-table addresses:
+# not a caller but a state-machine instruction and two data-table addresses; v10
+# fixes the `__vsprintf_chk` argument order, because disassembling the caller that
+# produced the empty path component showed it fills that name with a
+# `_FORTIFY_SOURCE` call whose buffer the emulator was leaving all-zero:
 #   patch A (identical to v1) adds the missing CoreFoundation entry point
 #     CFURLCreateDataAndPropertiesFromResource, the reason games showed a black
 #     screen;
@@ -150,8 +153,27 @@
 #     changes no return value and no branch, and it does not edit a single line
 #     patches A-G inserted - the panic backtrace and patch G's module are
 #     untouched, and the new lines go beside the existing ones.
-# The artifact is named hyperhle-core-ios-arm64-v9 so it cannot be mistaken for
-# the v1..v8 dylibs.
+#   patch I (new in v10) fixes a bug instead of instrumenting one. The v9 device
+#     log and the disassembly of the guest (fat slice 1, armv7s) agree on the
+#     root cause: the code that produces the empty path component builds the file
+#     name with `___vsprintf_chk(buf, 0, -1, format, ap)` after zeroing `buf`, and
+#     the emulator declared that routine with the six-argument order of
+#     `__vsnprintf_chk`. Apple's `__vsprintf_chk` has five parameters - `(str,
+#     flag, slen, format, ap)` - so the emulator read `maxlen = <flag> = 0`, and
+#     the delegated `vsnprintf` answered the length question without writing a
+#     byte (`if n == 0 { return ...; }`). The buffer stayed all-zero, the name was
+#     the empty string, `stringByAppendingPathComponent:` dropped it, and the game
+#     re-opened `<App>/Documents` as a directory about once every 13 frames for
+#     the whole run: the 36 `component=<empty>` warnings and the 28 all-1x1
+#     texture uploads of the v7/v9 logs. Patch I corrects the signature, treats
+#     `slen == -1` (the fortify macro's "unbounded") by delegating to the existing
+#     `vsprintf` rather than asking `vsnprintf` for a four-gigabyte slice, keeps a
+#     real `slen` bounded through `vsnprintf`, fixes the export entry to five
+#     placeholders, and logs the first 20 calls (`VSPRINTFCHK`). An audit of the
+#     other nine printf-family entries against Apple's libc found no other wrong
+#     signature; they are untouched.
+# The artifact is named hyperhle-core-ios-arm64-v10 so it cannot be mistaken for
+# the v1..v9 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -238,8 +260,8 @@ jobs:
 
       - name: Patch in the missing CoreFoundation API, the logging instrumentation,
              the bundle-root fallback, the EUC-KR decoding, the file/texture tracing,
-             the filesystem probe/write tracing, the path-origin tracing and the
-             nil-component stack trace
+             the filesystem probe/write tracing, the path-origin tracing, the
+             nil-component stack trace and the __vsprintf_chk signature fix
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -4401,6 +4423,287 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_H_PY
+          python3 - <<'PATCH_I_PY'
+          #!/usr/bin/env python3
+          """Fix the `__vsprintf_chk` signature (patch I, v10).
+
+          Counterpart of patch_cf_url.py (patch A), patch_logging_v2.py (patch B),
+          patch_ns_bundle_root_fallback_v4.py (patch C), patch_euckr_v5.py (patch D),
+          patch_fsinstrument_v6.py (patch E), patch_fsprobe_v7.py (patch F),
+          patch_originnil_v8.py (patch G) and patch_stacktrace_v9.py (patch H).
+
+          The bug
+          -------
+          `src/libc/stdio/printf.rs` declared `__vsprintf_chk` with the parameter order of
+          `__vsnprintf_chk`:
+
+              fn __vsprintf_chk(env, s, maxlen, _flag, _os, format, ap)   // 6 guest args
+              export_c_func!(__vsprintf_chk(_, _, _, _, _, _));           // 6
+
+          Apple's signature has five parameters and no length argument at all:
+
+              int __vsprintf_chk(char *str, int flag, size_t slen,
+                                 const char *format, va_list ap);
+
+          `slen` is `__darwin_obsz(str)`, the compiler-known destination size, and the
+          `vsprintf` fortify macro passes `-1` when it cannot be determined, meaning
+          "unbounded".
+
+          Disassembling the guest (fat slice 1, armv7s) shows the call:
+
+              memset(buf, 0, 100);
+              ___vsprintf_chk(buf, 0, -1, <format>, ap);
+              GetPath(buf, 1, 1);          // -> stringWithUTF8String: + path join, retries forever
+
+          With the old order touchHLE read `s=buf, maxlen=<flag=0>, ...`, so the delegated
+          `vsnprintf` saw `n == 0`, returned the formatted length immediately and wrote not
+          one byte (`if n == 0 { return res.len()...; }`). The caller's buffer stayed
+          all-zero, the file name it built was the empty string,
+          `-[NSString stringByAppendingPathComponent:]` dropped it, and the game re-opened
+          `<App>/Documents` as a directory about once every 13 frames for the whole run.
+          That is the `PATHJOIN WARNING ... component=<empty>` (36 times) and the 28
+          texture uploads that are all 1x1 placeholders in the v7/v9 device logs.
+
+          What it changes
+          ---------------
+            I1  `src/libc/stdio/printf.rs` / `__vsprintf_chk`: the signature becomes
+                `(env, s, _flag, slen, format, ap)`. `slen == GuestUSize::MAX` (`-1`) is
+                treated as unbounded and delegated to the existing `vsprintf`; a real
+                `slen` is still delegated to `vsnprintf` so the bound is honoured. The
+                branch is logged the first [VSPRINTFCHK_MAX] times.
+            I2  the `export_c_func!` entry loses its sixth `_`, so the guest and host agree
+                on the argument count again.
+
+          Signature audit (Apple's libc, checked against the headers, not guessed)
+          ------------------------------------------------------------------------
+            __vsprintf_chk    (str, flag, slen, format, ap)          -> was WRONG, fixed
+            __sprintf_chk     (str, flag, slen, format, ...)         -> already correct
+            __vsnprintf_chk   (str, size, flag, slen, format, ap)    -> already correct
+            __snprintf_chk    (str, maxlen, flag, slen, format, ...) -> already correct
+            vsprintf          (str, format, ap)                      -> already correct
+            vsnprintf         (str, size, format, ap)                -> already correct
+            vsprintf_l        (str, loc, format, ap)                 -> already correct
+            vsnprintf_l       (str, size, loc, format, ap)           -> already correct
+            sprintf           (str, format, ...)                     -> already correct
+            snprintf          (str, size, format, ...)               -> already correct
+          Only `__vsprintf_chk` is changed; the other nine keep the argument counts they
+          already had.
+
+          Usage: python3 patch_vsprintfchk_v10.py [repo-root]   (default: current directory)
+
+          The script applies the edits by exact text replacement, refuses to run unless
+          every anchor matches the expected number of times, skips edits that are already
+          applied (running it twice is safe) and re-checks every marker and the brace
+          balance afterwards.
+          """
+
+          import sys
+          from pathlib import Path
+
+          PRINTF_RS = "src/libc/stdio/printf.rs"
+
+
+          # I1: the corrected initialiser plus its rate limit. Everything goes in place of
+          # the one wrong function, so the patch does not touch a single other line.
+          VSPrintfChk_OLD = '''fn __vsprintf_chk(
+              env: &mut Environment,
+              s: MutPtr<u8>,
+              maxlen: GuestUSize,
+              _flag: i32,
+              _os: GuestUSize,
+              format: ConstPtr<u8>,
+              ap: VaList,
+          ) -> i32 {
+              vsnprintf(env, s, maxlen, format, ap)
+          }
+          '''
+
+          VSPrintfChk_NEW = '''/// How many `VSPRINTFCHK` lines print before the trace goes quiet.
+          const VSPRINTFCHK_MAX: u32 = 20;
+          /// `VSPRINTFCHK` lines printed so far, for the counter below.
+          static VSPRINTFCHK_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+          /// `int __vsprintf_chk(char *str, int flag, size_t slen, const char *format,
+          ///                     va_list ap)` — the `_FORTIFY_SOURCE` wrapper around
+          /// `vsprintf`.
+          ///
+          /// Patch I (v10) fixes the signature. It used to carry the parameter order of
+          /// `__vsnprintf_chk` (`s, maxlen, flag, slen, format, ap`), but Apple's
+          /// `__vsprintf_chk` has no length argument: the third parameter is the `flag`
+          /// and the fourth is the compiler-known destination size `__darwin_obsz(str)`.
+          /// Disassembled, the guest calls `___vsprintf_chk(buf, 0, -1, format, ap)`, so
+          /// with the old order touchHLE read `maxlen = 0` and the delegated `vsnprintf`
+          /// answered the length question without writing a byte (`n == 0` returns
+          /// early). The caller's buffer stayed all-zero, the file name it built was the
+          /// empty string, `stringByAppendingPathComponent:` dropped it, and the game
+          /// re-opened `<App>/Documents` as a directory for the whole run - the 1x1
+          /// placeholder textures and the black screen of the v7/v9 device logs.
+          ///
+          /// `slen` is `-1` (`GuestUSize::MAX`) when the compiler could not size the
+          /// destination, which the fortify macro spells as "unbounded": that case is
+          /// delegated to [vsprintf], because handing `0xFFFF_FFFF` to [vsnprintf] would
+          /// ask it for a four-gigabyte destination slice. A real `slen` is still handed
+          /// to [vsnprintf], so a bounded destination keeps its bound.
+          fn __vsprintf_chk(
+              env: &mut Environment,
+              s: MutPtr<u8>,
+              _flag: i32,
+              slen: GuestUSize,
+              format: ConstPtr<u8>,
+              ap: VaList,
+          ) -> i32 {
+              let res = if slen == GuestUSize::MAX {
+                  vsprintf(env, s, format, ap)
+              } else {
+                  vsnprintf(env, s, slen, format, ap)
+              };
+              // Patch I (v10): a rate-limited trace so a device run can confirm this entry
+              // point was reached and that bytes were actually written. Log only: `res` is
+              // returned unchanged and nothing here is read by the caller.
+              if VSPRINTFCHK_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < VSPRINTFCHK_MAX {
+                  log!(
+                      "VSPRINTFCHK dest={:?} slen={} fmt={:?} -> wrote={}",
+                      s,
+                      if slen == GuestUSize::MAX { "-1".to_string() } else { slen.to_string() },
+                      String::from_utf8_lossy(env.mem.cstr_at(format)),
+                      res
+                  );
+              }
+              res
+          }
+          '''
+
+          EXPORT_OLD = "    export_c_func!(__vsprintf_chk(_, _, _, _, _, _)),\n"
+          EXPORT_NEW = "    export_c_func!(__vsprintf_chk(_, _, _, _, _)),\n"
+
+
+          # An edit is (name, target file, anchor text, replacement, occurrences of the
+          # anchor that must be found, markers that prove the replacement landed).
+          EDITS = [
+              (
+                  "I1 __vsprintf_chk takes Apple's five arguments and treats slen=-1 as unbounded",
+                  PRINTF_RS,
+                  VSPrintfChk_OLD,
+                  VSPrintfChk_NEW,
+                  1,
+                  ("slen == GuestUSize::MAX", "vsprintf(env, s, format, ap)"),
+              ),
+              (
+                  "I2 the export table registers five arguments, not six",
+                  PRINTF_RS,
+                  EXPORT_OLD,
+                  EXPORT_NEW,
+                  1,
+                  ("export_c_func!(__vsprintf_chk(_, _, _, _, _)),",),
+              ),
+          ]
+
+
+          # (file, marker, occurrences) - the exact final counts of every line patch I
+          # inserts or changes. This is the patch-script half of the counts the v10
+          # self-check asserts against the built tree.
+          EXACT_CHECKS = (
+              (PRINTF_RS, "const VSPRINTFCHK_MAX: u32 = 20;", 1),
+              (PRINTF_RS, "let res = if slen == GuestUSize::MAX {", 1),
+              (PRINTF_RS, "vsprintf(env, s, format, ap)", 1),
+              (PRINTF_RS, "vsnprintf(env, s, slen, format, ap)", 1),
+              (PRINTF_RS, 'VSPRINTFCHK dest={:?} slen={} fmt={:?} -> wrote={}', 1),
+              (PRINTF_RS, "export_c_func!(__vsprintf_chk(_, _, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(__vsprintf_chk(_, _, _, _, _, _)),", 0),
+          )
+
+          # The other nine printf-family entries the audit found already correct. Patch I
+          # must not perturb any of them, so their counts are re-checked here too.
+          UNTOUCHED_CHECKS = (
+              (PRINTF_RS, "export_c_func!(__sprintf_chk(_, _, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(__vsnprintf_chk(_, _, _, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(__snprintf_chk(_, _, _, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(vsprintf(_, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(vsnprintf(_, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(vsprintf_l(_, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(vsnprintf_l(_, _, _, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(sprintf(_, _, _)),", 1),
+              (PRINTF_RS, "export_c_func!(snprintf(_, _, _, _)),", 1),
+          )
+
+
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          def balance(text):
+              return text.count("{") == text.count("}")
+
+
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+              targets = sorted({edit[1] for edit in EDITS})
+              texts = {}
+              for target in targets:
+                  path = repo / target
+                  if not path.is_file():
+                      fail("{} does not exist; patch I expects a tree patches A-H already ran on".format(path))
+                  texts[target] = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+              for name, target, old, new, occurrences, markers in EDITS:
+                  text = texts[target]
+                  if new in text:
+                      # The replacement text is already there, so this edit has run.
+                      print("already applied: {} ({})".format(name, target))
+                      continue
+                  if old not in text:
+                      fail("{}: neither the anchor nor the replacement of \"{}\" is present; "
+                           "this is not a tree patch I recognises".format(target, name))
+                  found = text.count(old)
+                  if found != occurrences:
+                      fail(
+                          "{}: expected {} occurrence(s) of the anchor text for \"{}\", found {}".format(
+                              target, occurrences, name, found
+                          )
+                      )
+                  replaced = text.replace(old, new)
+                  if replaced == text:
+                      fail("{}: \"{}\" did not change the file".format(target, name))
+                  if replaced.count("{") - text.count("{") != replaced.count("}") - text.count("}"):
+                      fail("{}: \"{}\" changed the brace balance".format(target, name))
+                  for marker in markers:
+                      if marker not in replaced:
+                          fail("{}: \"{}\" did not land ({!r} is missing)".format(target, name, marker))
+                  texts[target] = replaced
+                  print("applied: {} ({})".format(name, target))
+
+              # Every line patch I inserts or changes, with its exact final count.
+              for target, marker, expected in EXACT_CHECKS:
+                  found = texts[target].count(marker)
+                  if found != expected:
+                      fail("post-condition failed: {} contains {} occurrence(s) of {!r}, expected {}".format(
+                          target, found, marker, expected))
+
+              for target, text in texts.items():
+                  if not balance(text):
+                      fail("{}: braces are unbalanced at the end ({} '{{' vs {} '}}')".format(
+                          target, text.count("{"), text.count("}")))
+                  path = repo / target
+                  with open(path, "w", encoding="utf-8", newline="\n") as output_file:
+                      output_file.write(text)
+                  print("wrote {}".format(path))
+
+              # The nine printf-family entries the audit found already correct.
+              for target, marker, expected in UNTOUCHED_CHECKS:
+                  found = texts[target].count(marker)
+                  if found != expected:
+                      fail("{}: {!r} appears {} time(s), expected {}".format(
+                          target, marker, found, expected))
+              print("post-check: __vsprintf_chk now takes Apple's five arguments and treats "
+                    "slen=-1 as unbounded, its export entry has five placeholders, and the "
+                    "other nine printf-family signatures the audit checked are untouched")
+
+
+          if __name__ == "__main__":
+              main()
+          PATCH_I_PY
 
       - name: Check that the patches really landed
         run: |
@@ -4408,8 +4711,8 @@ jobs:
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
           # bundle-root resource fallback (C, v4), the EUC-KR decoding patch (D, v5), the
           # file-access / texture-upload tracing (E, v6), the filesystem probe / write
-          # tracing (F, v7), the path-origin tracing (G, v8) and the nil-component stack
-          # trace (H, v9).
+          # tracing (F, v7), the path-origin tracing (G, v8), the nil-component stack
+          # trace (H, v9) and the `__vsprintf_chk` signature fix (I, v10).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
@@ -4418,7 +4721,9 @@ jobs:
           # that explain a path which is opened over and over but is never a file, still
           # cannot say which guest call produced the nil path component that turned that
           # path into a directory, or still reports only the single PC/return-address pair
-          # that the v8 device log proved is not a caller.
+          # that the v8 device log proved is not a caller, or still left the buffer of a
+          # `_FORTIFY_SOURCE` printf all-zero because `__vsprintf_chk` read the wrong
+          # argument.
 
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -5387,6 +5692,88 @@ jobs:
                 "module stays a pure logger that does not touch patch F's module")
           CHECK_FSSTACK
 
+          echo "== patch I (v10): the __vsprintf_chk argument order =="
+          # Patch I fixes one signature and its export entry. The counts are exact, and the
+          # old six-placeholder export must be gone, or the guest and the emulator still
+          # disagree about the arguments. The A-H assertions above are unchanged: the v10
+          # script is the v9 script with this section appended.
+          printf_rs=src/libc/stdio/printf.rs
+          check_marker "$printf_rs" "const VSPRINTFCHK_MAX: u32 = 20;" 1
+          check_marker "$printf_rs" "let res = if slen == GuestUSize::MAX {" 1
+          check_marker "$printf_rs" "vsprintf(env, s, format, ap)" 1
+          check_marker "$printf_rs" "vsnprintf(env, s, slen, format, ap)" 1
+          check_marker "$printf_rs" 'VSPRINTFCHK dest={:?} slen={} fmt={:?} -> wrote={}' 1
+          check_marker "$printf_rs" "export_c_func!(__vsprintf_chk(_, _, _, _, _))," 1
+          # The old form carried six placeholders, i.e. the parameter order of
+          # __vsnprintf_chk. It must be gone.
+          check_marker "$printf_rs" "export_c_func!(__vsprintf_chk(_, _, _, _, _, _))," 0
+
+          python3 - <<'CHECK_VSPRINTFCHK'
+          import pathlib
+          import sys
+
+          # The checks a substring count cannot make: the parameters have to be Apple's
+          # five, in order, with no `maxlen`; slen == -1 has to take the unbounded path and
+          # a real slen the bounded one; the trace has to be rate limited; and the nine
+          # other printf-family signatures the audit checked must be untouched.
+          problems = []
+
+          printf = pathlib.Path("src/libc/stdio/printf.rs").read_text(encoding="utf-8")
+
+          head = "fn __vsprintf_chk(\n"
+          body = printf[printf.index(head) + len(head):]
+          body = body[:body.index("\n}")]
+          params = [line.strip().rstrip(",") for line in body.split(") -> i32 {")[0].splitlines()]
+          wanted = ["env: &mut Environment", "s: MutPtr<u8>", "_flag: i32",
+                    "slen: GuestUSize", "format: ConstPtr<u8>", "ap: VaList"]
+          if params != wanted:
+              problems.append("src/libc/stdio/printf.rs: __vsprintf_chk parameters are {!r}, expected {!r}".format(
+                  params, wanted))
+          for needed in ("let res = if slen == GuestUSize::MAX {",
+                         "vsprintf(env, s, format, ap)",
+                         "vsnprintf(env, s, slen, format, ap)",
+                         "VSPRINTFCHK_MAX",
+                         "VSPRINTFCHK_LINES.fetch_add(1"):
+              if needed not in body:
+                  problems.append("src/libc/stdio/printf.rs: __vsprintf_chk is missing {!r}".format(needed))
+          branch = body[body.index("let res = if slen == GuestUSize::MAX {"):]
+          branch = branch[:branch.index("} else {")]
+          if "vsprintf(env, s, format, ap)" not in branch:
+              problems.append("src/libc/stdio/printf.rs: the slen == -1 branch does not delegate to vsprintf")
+          else_arm = body[body.index("} else {"):]
+          else_arm = else_arm[:else_arm.index("};")]
+          if "vsnprintf(env, s, slen, format, ap)" not in else_arm:
+              problems.append("src/libc/stdio/printf.rs: a real slen does not delegate to vsnprintf")
+          if "maxlen" in body:
+              problems.append("src/libc/stdio/printf.rs: __vsprintf_chk still uses the six-argument name maxlen")
+
+          # The nine other entries the audit found already correct, and the five-argument
+          # entry patch I writes. Nothing else may carry __vsprintf_chk's old shape.
+          for entry in ("export_c_func!(__sprintf_chk(_, _, _, _, _)),",
+                        "export_c_func!(__vsnprintf_chk(_, _, _, _, _, _)),",
+                        "export_c_func!(__snprintf_chk(_, _, _, _, _, _)),",
+                        "export_c_func!(vsprintf(_, _, _)),",
+                        "export_c_func!(vsnprintf(_, _, _, _)),",
+                        "export_c_func!(vsprintf_l(_, _, _, _)),",
+                        "export_c_func!(vsnprintf_l(_, _, _, _, _)),",
+                        "export_c_func!(sprintf(_, _, _)),",
+                        "export_c_func!(snprintf(_, _, _, _)),"):
+              if entry not in printf:
+                  problems.append("src/libc/stdio/printf.rs: the audit entry {!r} is missing".format(entry))
+
+          if printf.count("{") != printf.count("}"):
+              problems.append("src/libc/stdio/printf.rs: braces are unbalanced")
+
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch I: __vsprintf_chk takes Apple's five arguments (str, flag, slen, format, ap), "
+                "treats slen == -1 as unbounded via vsprintf and a real slen via vsnprintf, logs the "
+                "first 20 calls, and its export entry has five placeholders; the nine other "
+                "printf-family signatures the audit checked are unchanged")
+          CHECK_VSPRINTFCHK
+
       - name: Build the shared SDL2 the core links against
         run: |
           set -eu
@@ -5475,7 +5862,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v9
+          name: hyperhle-core-ios-arm64-v10
           path: dist/*
           if-no-files-found: error
           retention-days: 30
