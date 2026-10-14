@@ -203,8 +203,37 @@
 #     language or `NSBundle` logic (the app hard-codes the "English"
 #     localization, which is unrelated to this bug). v12 is based on v10 rather
 #     than v11 so that the device log stays as clean as the v10 one.
-# The artifact is named hyperhle-core-ios-arm64-v15 so it cannot be mistaken for
-# the v1..v14 dylibs.
+#   patch M (new in v16) is a real fix, and it is the other half of patch L. Patch
+#     L made the *text* paths CJK-aware, but the app under test showed no
+#     `CJKFONT` and no `CJKNODEF` line at all, so its text never reaches them. The
+#     remaining system-font route is the glyph-id one: `CTFontGetGlyphsForCharacters`
+#     and `CGFontGetGlyphsForUnichars` turn characters into ids, and
+#     `CGContextShowGlyphsAtPoint`/`...AtPositions`/`...WithAdvances` draw those
+#     ids. A glyph id is an index into one font's `cmap`, so an id produced by a
+#     Latin face and drawn by a Latin face is `.notdef` - the empty box - and an id
+#     produced by one face and drawn by another is an arbitrary wrong glyph. Patch
+#     L could not touch that half on its own for exactly that reason, and this
+#     patch is the missing half: the character-to-id step substitutes the
+#     CJK/Arabic fallback face only for characters the caller's own font cannot
+#     draw, records the face that produced each substituted id, and the drawing
+#     entry points draw a run with the recorded face - but only when *every* id in
+#     the run came from that one face, so a run containing an id from anywhere else
+#     keeps the caller's font and nothing is ever drawn with the wrong face. An id
+#     two different faces produced is dropped as ambiguous rather than resolved.
+#     The returned `all_mapped` flag keeps the meaning it has on iOS for the font
+#     the caller passed in, so no app's control flow changes. Because a log that
+#     only fires on a suspicious run cannot test whether the app uses this pipeline
+#     at all, the three new traces are unconditional and rate limited (first 40
+#     calls, then one line every 200): `CTFONTGLYPHS ctfont=... key=... chars=...
+#     cjk=... arabic=... base_notdef=... substituted=... notdef_out=...`,
+#     `CGFONTGLYPHS font=... chars=... cjk=... base_notdef=... substituted=...` and
+#     `CGGLYPHS <entry> font=... key=... size=... n=... notdef=... ids=[...]
+#     draw_with=...`. A device log with none of them proves the boxes are not
+#     produced by the emulator's font stack at all; one with `cjk > 0` and
+#     `notdef_out > 0` while the boxes persist proves they are not produced here
+#     either. v16 is v15 (A-K, v13, v14) plus this one patch.
+# The artifact is named hyperhle-core-ios-arm64-v16 so it cannot be mistaken for
+# the v1..v15 dylibs.
 name: Build iOS emulator core (dylib)
 
 on:
@@ -294,7 +323,8 @@ jobs:
              the filesystem probe/write tracing, the path-origin tracing, the
              nil-component stack trace, the __vsprintf_chk signature fix and the
              guest-filesystem resource read, the shared touch/render geometry,
-             the CJK/Arabic text fallback and the glyph-id .notdef trace
+             the CJK/Arabic text fallback, the glyph-id .notdef trace and the
+             CJK/Arabic glyph-id pipeline
         run: |
           set -eu
           python3 - <<'PATCH_A_PY'
@@ -6601,9 +6631,1510 @@ jobs:
           if __name__ == "__main__":
               main()
           PATCH_V14_CJK_TEXT_PY
+          python3 - <<'PATCH_V16_CJK_GLYPH_PY'
+          #!/usr/bin/env python3
+          """Make the CJK/Arabic glyph ids and the font that draws them the same face.
+          
+          The problem
+          -----------
+          Patch L (v14) made the *text* paths CJK-aware: a string that reaches
+          `UIFont`/`NSString` drawing or `CTLineDraw` is laid out and rasterised with
+          Noto Sans SC, so it no longer comes out as one empty box per character.
+          
+          The glyph-id path cannot be fixed that way, and patch L deliberately left it
+          alone. `CTFontGetGlyphsForCharacters` and `CGFontGetGlyphsForUnichars` are the
+          only two places where characters become glyph ids; `CGContextShowGlyphsAtPoint`,
+          `...AtPositions` and `...WithAdvances` are the only places that draw those ids.
+          A glyph id is an index into the `cmap` of one specific font: the same number is a
+          different glyph in a different font, and glyph id 0 is `.notdef` in all of them.
+          So an app that maps "地下城" through a Latin UIFont gets three `.notdef` ids, and
+          the drawing call - which is handed ids, not characters - cannot tell whether the
+          box it is about to paint is the requested glyph or a hole. Substituting a Noto
+          glyph id in the mapper *without* telling the drawing side would be worse than the
+          box: the id would be interpreted in the Latin font's `cmap`, i.e. an arbitrary
+          wrong glyph.
+          
+          What this script does
+          ---------------------
+          It carries the face across that boundary, per glyph id:
+          
+            * `src/frameworks/uikit/ui_font.rs` gains the shared pieces: `FallbackScript`,
+              `fallback_for_char` (the one place that decides "this codepoint needs a
+              fallback", reusing the existing `is_cjk_char`/`is_arabic_char`),
+              `GlyphKey` (which namespace a font's ids belong to), `GlyphFace`
+              (script + weight of the face that produced an id), `glyph_space_for_uifont`,
+              and the glyph-fallback registry on `State`. `font_kind_is_bold` becomes
+              `pub(crate)` because the mapping side has to pick the same weight the text
+              paths pick.
+            * `src/frameworks/uikit.rs` exposes the registry through the shared state, the
+              same way patch L exposed `font_for_text` - so an 8 MB Noto face is parsed
+              once, not once per call.
+            * `src/frameworks/core_text.rs` (`CTFontGetGlyphsForCharacters`): a character
+              the caller's font cannot map (id 0) that needs CJK/Arabic is mapped through
+              the fallback face instead, and the resulting id is *recorded* against the
+              face that produced it.
+            * `src/frameworks/core_graphics/cg_font.rs`
+              (`CGFontGetGlyphsForUnichars`): the same for a `CGFont` built from the app's
+              own font data - it has no UIFont kind, so its ids are keyed by the object,
+              and the regular-weight face is the only choice. `CGFontHostObject` gains the
+              key that says which namespace its ids are in.
+            * `src/frameworks/core_graphics/cg_context.rs`: `CGContextSetFont` records the
+              key of the face it wraps (keyed by `FontKind`, not by address, because
+              `CTFontCopyGraphicsFont` hands out a *different* UIFont object for the same
+              face); the three glyph-id drawing entry points look the run up in the
+              registry and draw it with the recorded face.
+          
+          Why the ids and the font now agree
+          ---------------------------------
+          The registry maps `(font key, glyph id) -> face`. Three rules keep it sound:
+          
+            1. A substitution only happens when the caller's own font returned `.notdef`
+               for that character. A font that can draw the character is never overridden,
+               so Latin text and apps with their own CJK font keep their glyphs.
+            2. A run is redirected only when *every* id in it was produced by one and the
+               same fallback face. A run containing any other id (an id from another font,
+               or one this registry has no record for) is drawn exactly as before: the ids
+               stay in the namespace they were made in, and nothing is drawn with the wrong
+               face. Empty runs, unknown runs and mixed runs all fall back to the caller's
+               own font.
+            3. Two different faces producing the same id for the same font key make the
+               entry ambiguous, and an ambiguous entry is dropped rather than resolved, so
+               there is no coin-flip between two candidate faces.
+          
+          The return value of both mapping functions keeps the meaning it has on iOS for
+          the font the caller passed in (false when *that* font did not cover the string).
+          Repairing the ids must not change an app's control flow - only what is drawn if
+          the app draws anyway - and an app that checks the flag and skips already draws
+          nothing today rather than empty boxes.
+          
+          Diagnostics (the evidence this build exists for)
+          -----------------------------------------------
+          Four normal-level (`log!`, not the `log_dbg!` that `log::ENABLED_MODULES`
+          suppresses on device), rate-limited traces. The three glyph-id ones name the
+          first 40 calls of each and then one line every 200 calls; `DRAWFONT` names the
+          first 60 calls of *each drawing entry* and then one line every 200, because a UI
+          element drawn one character at a time has to show more than one line. They are
+          deliberately *not* limited to CJK or `.notdef` runs, because a trace that only
+          fires on a suspicious run cannot distinguish "the app never maps glyphs this way"
+          from "it does and the run is clean" - and that is the question a device log has
+          to settle:
+          
+            * `CTFONTGLYPHS ctfont=0x.. key=.. chars=.. cjk=.. arabic=.. base_notdef=..
+              substituted=.. notdef_out=.. all_mapped=..`
+            * `CGFONTGLYPHS font=0x.. chars=.. cjk=.. arabic=.. base_notdef=..
+              substituted=.. notdef_out=..`
+            * `CGGLYPHS <entry> font=0x.. key=.. size=.. n=.. notdef=.. ids=[.. up to 8 ..]
+              draw_with=..`
+            * `DRAWFONT entry=.. phase=measure|draw text=".. up to 32 characters .."
+              cjk=.. font=.. notdef=.. chars=.. cps=[U+XXXX .. up to 12 ..] gids=[.. up to
+              12 ..]`
+          
+          A device log in which the first two never appear proves the app does not map
+          glyphs through CoreText/CGFont at all (patch L's `CJKFONT` and this build's
+          `CGGLYPHS` together cover the whole system-font text surface); a log in which
+          `CTFONTGLYPHS`/`CGFONTGLYPHS` appear with `cjk > 0` and `notdef_out > 0` while
+          the boxes persist proves the boxes are *not* produced here either.
+          
+          `DRAWFONT` is the direct answer to "which face put these pixels on the screen".
+          It fires at every entry that rasterises a string or hands glyph ids to the
+          rasteriser, at the point that entry has chosen its face, and prints the face it
+          chose next to the number of characters *that* face maps to `.notdef`. A box on
+          screen plus a `DRAWFONT` line whose `font=` maps the character to `.notdef` name
+          the entry that painted it; a `notdef=0` line rules that entry out and says the box
+          came from somewhere else. An entry that measures with one face fetch and paints
+          with another prints both, so the two can be compared: patch L made the *measure*
+          side CJK-aware, and this is how the draw side is shown to agree or to disagree.
+          
+          This patch deliberately does **not** implement `CGContextSelectFont`,
+          `CGContextShowText` or `CGContextShowTextAtPoint`. They are empty stubs in this
+          tree, nothing in the app under test reaches them (the device log showed no line
+          from them and the boxed text *was* measured), and implementing them would be a
+          new feature rather than a fix. The v15 self-check's assertion that they stay
+          empty therefore still holds, unchanged - this patch does not touch them at all.
+          
+          Usage: python3 patch_cjk_glyph_pipeline_v16.py [repo-root]   (default: .)
+          
+          The script refuses to run unless every edit applies cleanly, and re-checks the
+          result afterwards, so a silent no-op is impossible. Running it twice is a no-op.
+          Requires patches A-K, v13 and v14 (v15) to be applied first: patch L is what
+          established `font_kind_from_uifont`, `font_kind_is_bold` and the shared state
+          accessor this patch extends.
+          """
+          
+          import sys
+          from pathlib import Path
+          
+          # Marks the patch. One per touched file: a file that already contains its marker
+          # is left alone, which is what makes a second run a no-op.
+          PATCH_MARKER = "Patch M (v16):"
+          
+          UI_FONT = "src/frameworks/uikit/ui_font.rs"
+          UIKIT = "src/frameworks/uikit.rs"
+          CORE_TEXT = "src/frameworks/core_text.rs"
+          CG_FONT = "src/frameworks/core_graphics/cg_font.rs"
+          CG_CONTEXT = "src/frameworks/core_graphics/cg_context.rs"
+          
+          # --------------------------------------------------------------------------
+          # 1. ui_font.rs: the shared classification, key, face and registry
+          # --------------------------------------------------------------------------
+          
+          UI_FONT_OLD_DRAW_AT_POINT = r'''    let font = get_font(
+                  &mut env.framework_state.uikit.ui_font,
+                  host_object.kind,
+                  text,
+              );
+              let width_and_line_break_mode =
+          '''
+          
+          UI_FONT_NEW_DRAW_AT_POINT = r'''    let font = get_font(
+                  &mut env.framework_state.uikit.ui_font,
+                  host_object.kind,
+                  text,
+              );
+              // Patch M (v16): this entry measures and paints with the one face it selects
+              // here, so both phases are traced with that face. `notdef=` on the draw line
+              // is what says whether the CJK fallback reached the pixels or whether the box
+              // on screen is this face's `.notdef`.
+              static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              let draw_font_label = face_label(None, Some(host_object.kind), text);
+              note_draw_font(
+                  &DRAWFONT_CALLS,
+                  "ui_font::draw_at_point",
+                  "measure",
+                  font,
+                  text,
+                  &draw_font_label,
+                  None,
+              );
+              let width_and_line_break_mode =
+          '''
+          
+          # The draw phase of draw_at_point: the call that rasterises. `DRAWFONT_CALLS` and
+          # `draw_font_label` come from the block above, the same face both phases use.
+          UI_FONT_OLD_DRAW_CALL_AT_POINT = '''    font.draw(
+                  host_object.size,
+                  text,
+                  (point.x, point.y),
+          '''
+          
+          UI_FONT_NEW_DRAW_CALL_AT_POINT = '''    // Patch M (v16): the drawing phase of this entry, at the call that rasterises.
+              note_draw_font(
+                  &DRAWFONT_CALLS,
+                  "ui_font::draw_at_point",
+                  "draw",
+                  font,
+                  text,
+                  &draw_font_label,
+                  None,
+              );
+              font.draw(
+                  host_object.size,
+                  text,
+                  (point.x, point.y),
+          '''
+          
+          # draw_in_rect measures through `size_with_font` and then fetches a face of its
+          # own to paint with. The measurement's face is resolved with the same CJK-aware
+          # lookup (`get_font`, a pure function of the kind and the text), so the measure
+          # line below names the face that measures and the draw line names the face that
+          # paints.
+          UI_FONT_OLD_DRAW_IN_RECT = '''    let context = UIGraphicsGetCurrentContext(env);
+              let text_size = size_with_font(env, font, text, Some((rect.size, line_break_mode)));
+          '''
+          
+          UI_FONT_NEW_DRAW_IN_RECT = '''    let context = UIGraphicsGetCurrentContext(env);
+              // Patch M (v16): the measuring phase of this entry.
+              static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              {
+                  let measure_kind = font_kind_from_uifont(env, font).unwrap_or(FontKind::SansRegular);
+                  let measure_label = face_label(None, Some(measure_kind), text);
+                  let measure_face = env.framework_state.uikit.font_for_text(measure_kind, text);
+                  note_draw_font(
+                      &DRAWFONT_CALLS,
+                      "ui_font::draw_in_rect",
+                      "measure",
+                      measure_face,
+                      text,
+                      &measure_label,
+                      None,
+                  );
+              }
+              let text_size = size_with_font(env, font, text, Some((rect.size, line_break_mode)));
+          '''
+          
+          UI_FONT_OLD_DRAW_CALL_IN_RECT = '''    font.draw(
+                  host_object.size,
+                  text,
+                  (rect.origin.x + origin_x_offset, rect.origin.y),
+          '''
+          
+          UI_FONT_NEW_DRAW_CALL_IN_RECT = '''    // Patch M (v16): the drawing phase of this entry, at the call that rasterises.
+              {
+                  let draw_label = face_label(None, Some(host_object.kind), text);
+                  note_draw_font(
+                      &DRAWFONT_CALLS,
+                      "ui_font::draw_in_rect",
+                      "draw",
+                      font,
+                      text,
+                      &draw_label,
+                      None,
+                  );
+              }
+              font.draw(
+                  host_object.size,
+                  text,
+                  (rect.origin.x + origin_x_offset, rect.origin.y),
+          '''
+          
+          UI_FONT_OLD_SHARED = r'''/// [FontKind]s whose fallback face is the bold one.
+          fn font_kind_is_bold(kind: FontKind) -> bool {
+          '''
+          
+          UI_FONT_NEW_SHARED = r'''/// Patch M (v16): the script-specific face a character needs, if the bundled
+          /// Latin/serif/mono faces cannot draw it.
+          ///
+          /// This is the single definition of "this text needs a fallback". It is shared
+          /// by the text APIs (through [get_font]) and by the glyph-id pipeline (through
+          /// [fallback_for_char] and [State::fallback_glyph_id]), because a glyph id is
+          /// only meaningful together with the font that produced it: the pipeline that
+          /// turns characters into ids and the one that draws those ids have to agree on
+          /// the face.
+          #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+          pub(crate) enum FallbackScript {
+              Cjk,
+              Arabic,
+          }
+          
+          /// Patch M (v16): the face `c` needs, or `None` when the bundled faces cover it.
+          /// The ranges themselves live in `is_cjk_char` / `is_arabic_char` above.
+          pub(crate) fn fallback_for_char(c: u32) -> Option<FallbackScript> {
+              let cjk = is_cjk_char(c);
+              let arabic = is_arabic_char(c);
+              if cjk {
+                  Some(FallbackScript::Cjk)
+              } else if arabic {
+                  Some(FallbackScript::Arabic)
+              } else {
+                  None
+              }
+          }
+          
+          /// Patch M (v16): which namespace a font object's glyph ids belong to.
+          ///
+          /// A glyph id is an index into one font's `cmap`, so "which font produced this
+          /// id" has to be recoverable when the id is drawn. A UIFont is identified by its
+          /// [FontKind] rather than by its address: two UIFont objects with the same kind
+          /// parse the same bundled file and therefore share one id space, and CoreText's
+          /// `CTFontCopyGraphicsFont` hands out a *different* UIFont object for the same
+          /// face - address keying would miss the link. A `CGFont` built from the app's
+          /// own font data has no kind and gets its own key.
+          #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+          pub(crate) enum GlyphKey {
+              Kind(FontKind),
+              Object(usize),
+          }
+          
+          /// Patch M (v16): the fallback face that produced a glyph id, and the weight it
+          /// was chosen for. `Copy`, so it can be logged without holding the state
+          /// borrowed.
+          #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+          pub(crate) struct GlyphFace {
+              pub script: FallbackScript,
+              pub bold: bool,
+          }
+          
+          /// Patch M (v16): how the glyph ids of a UIFont are keyed, and whether the bold
+          /// fallback face applies to them. One function, so the glyph pipeline cannot
+          /// look at the kind in two different ways.
+          pub(crate) struct UIFontGlyphSpace {
+              pub key: GlyphKey,
+              pub bold: bool,
+          }
+          
+          pub(crate) fn glyph_space_for_uifont(
+              env: &mut Environment,
+              obj: crate::objc::id,
+          ) -> UIFontGlyphSpace {
+              let kind = font_kind_from_uifont(env, obj).unwrap_or(FontKind::SansRegular);
+              UIFontGlyphSpace {
+                  key: GlyphKey::Kind(kind),
+                  bold: font_kind_is_bold(kind),
+              }
+          }
+          
+          /// Patch M (v16): the logging policy of the glyph pipeline, shared by the
+          /// character-to-id side and the drawing side: the first 40 calls are all named,
+          /// after that one summary line every 200 calls.
+          ///
+          /// `log!` and not `log_dbg!`: `log::ENABLED_MODULES` is empty on purpose
+          /// (`src/log.rs`), so every debug-level log in this crate is suppressed on
+          /// device.
+          pub(crate) fn glyph_log_due(counter: &std::sync::atomic::AtomicUsize) -> bool {
+              let call = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+              call <= 40 || call % 200 == 0
+          }
+          
+          /// Patch M (v16): the fallback face a string needs, if any, with CJK winning
+          /// over Arabic - the priority [get_font] gives them. The ranges themselves stay
+          /// in [fallback_for_char], so this is a label, not a second copy of the decision.
+          fn fallback_script_for_text(text: &str) -> Option<FallbackScript> {
+              let mut found = None;
+              for c in text.chars() {
+                  match fallback_for_char(c as u32) {
+                      Some(FallbackScript::Cjk) => return Some(FallbackScript::Cjk),
+                      Some(script) => {
+                          if found.is_none() {
+                              found = Some(script);
+                          }
+                      }
+                      None => {}
+                  }
+              }
+              found
+          }
+          
+          /// Patch M (v16): the name `DRAWFONT` prints for the face that is about to
+          /// rasterise.
+          ///
+          /// `face` is the fallback face the glyph-id pipeline recorded for a run; a text
+          /// path has no such record, so it passes the [FontKind] it selected plus the
+          /// text, and the fallback half of the name comes from the same two predicates
+          /// [get_font] uses - [fallback_for_char] for the script and [font_kind_is_bold]
+          /// for the weight - so the label cannot disagree with the face that was picked.
+          pub(crate) fn face_label(face: Option<GlyphFace>, kind: Option<FontKind>, text: &str) -> String {
+              let (script, bold) = match face {
+                  Some(face) => (Some(face.script), face.bold),
+                  None => (
+                      fallback_script_for_text(text),
+                      kind.map(font_kind_is_bold).unwrap_or(false),
+                  ),
+              };
+              match script {
+                  Some(FallbackScript::Cjk) => {
+                      if bold {
+                          "NotoSansSC-Bold.otf".to_string()
+                      } else {
+                          "NotoSansSC-Regular.otf".to_string()
+                      }
+                  }
+                  Some(FallbackScript::Arabic) => {
+                      if bold {
+                          "NotoSansArabic-Bold.ttf".to_string()
+                      } else {
+                          "NotoSansArabic-Regular.ttf".to_string()
+                      }
+                  }
+                  None => match kind {
+                      Some(kind) => format!("{:?}", kind),
+                      None => "CGFont(app-data)".to_string(),
+                  },
+              }
+          }
+          
+          /// Patch M (v16): the logging policy of `DRAWFONT`: the first 60 calls of each
+          /// drawing entry are all named - so an entry that draws a string one character
+          /// at a time shows up as more than one line - and after that one line every 200
+          /// calls. Every call site owns its counter, so a busy entry cannot silence
+          /// another.
+          pub(crate) fn draw_log_due(counter: &std::sync::atomic::AtomicUsize) -> bool {
+              let call = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+              call <= 60 || call % 200 == 0
+          }
+          
+          /// Patch M (v16): the glyph id `font` maps `c` to, as the 16-bit UTF-16 unit
+          /// [Font::glyph_id_for_char] takes. A character outside the BMP is reported as
+          /// `.notdef` rather than decoded into a lone surrogate, which that function does
+          /// not accept.
+          fn glyph_id_unit(font: &Font, c: char) -> u16 {
+              if (c as u32) > 0xFFFF {
+                  return 0;
+              }
+              font.glyph_id_for_char(c as u16).0
+          }
+          
+          /// Patch M (v16): the trace of the entry points that put text on the screen.
+          ///
+          /// One line per font fetch, at the point the entry has chosen its face:
+          ///
+          ///   * `entry` is the entry point and `phase` is `measure` or `draw`;
+          ///   * `font` is the face that will do the rasterising and `label` is
+          ///     [face_label]'s name for it;
+          ///   * `text` is what it will draw - empty for the glyph-id entry points, which
+          ///     are handed ids rather than characters - and `glyph_ids` are those ids;
+          ///   * `notdef` is how many characters (or ids) that face maps to `.notdef`;
+          ///   * `cps` are the first 12 characters as codepoints and `gids` the same 12 as
+          ///     the glyph ids *this* face gives them, because the pair is what separates
+          ///     "this face cannot draw the character" from "another face drew it".
+          pub(crate) fn note_draw_font(
+              counter: &std::sync::atomic::AtomicUsize,
+              entry: &str,
+              phase: &str,
+              font: &Font,
+              text: &str,
+              label: &str,
+              glyph_ids: Option<&[u16]>,
+          ) {
+              if !draw_log_due(counter) {
+                  return;
+              }
+              let sample: String = text.chars().take(32).collect();
+              let cjk = text.chars().filter(|c| is_cjk_char(*c as u32)).count();
+              let (chars, units, notdef) = match glyph_ids {
+                  Some(ids) => (
+                      ids.len(),
+                      ids.to_vec(),
+                      ids.iter().filter(|id| **id == 0).count(),
+                  ),
+                  None => (
+                      text.chars().count(),
+                      text.chars()
+                          .take(12)
+                          .map(|c| glyph_id_unit(font, c))
+                          .collect(),
+                      text.chars().filter(|c| glyph_id_unit(font, *c) == 0).count(),
+                  ),
+              };
+              let cps = text
+                  .chars()
+                  .take(12)
+                  .map(|c| format!("U+{:04X}", c as u32))
+                  .collect::<Vec<_>>()
+                  .join(" ");
+              let gids = units
+                  .iter()
+                  .take(12)
+                  .map(|id| {
+                      if *id == 0 {
+                          ".notdef".to_string()
+                      } else {
+                          format!("{}", id)
+                      }
+                  })
+                  .collect::<Vec<_>>()
+                  .join(" ");
+              log!(
+                  "DRAWFONT entry={} phase={} text=\"{}\" cjk={} font={} notdef={} chars={} cps=[{}] gids=[{}]",
+                  entry,
+                  phase,
+                  sample,
+                  cjk,
+                  label,
+                  notdef,
+                  chars,
+                  cps,
+                  gids
+              );
+          }
+          
+          /// Patch M (v16): the same line for an `NSString` drawing entry.
+          ///
+          /// The face is resolved with the CJK-aware lookup the entry's target uses
+          /// (`State::font_for_text`, i.e. [get_font]), so the line names the face that is
+          /// about to rasterise instead of guessing it, and no second selection exists.
+          pub(crate) fn note_draw_font_for(
+              counter: &std::sync::atomic::AtomicUsize,
+              env: &mut Environment,
+              entry: &str,
+              font: id,
+              text: &str,
+          ) {
+              let kind = font_kind_from_uifont(env, font).unwrap_or(FontKind::SansRegular);
+              let label = face_label(None, Some(kind), text);
+              let face = env.framework_state.uikit.font_for_text(kind, text);
+              note_draw_font(counter, entry, "draw", face, text, &label, None);
+          }
+          
+          /// [FontKind]s whose fallback face is the bold one. Patch M (v16): `pub(crate)`,
+          /// because the glyph pipeline has to pick the same weight the text paths pick.
+          pub(crate) fn font_kind_is_bold(kind: FontKind) -> bool {
+          '''
+          
+          UI_FONT_OLD_STATE_FIELD = r'''    sans_regular_ar: Option<Font>,
+              sans_bold_ar: Option<Font>,
+          }
+          '''
+          
+          UI_FONT_NEW_STATE_FIELD = r'''    sans_regular_ar: Option<Font>,
+              sans_bold_ar: Option<Font>,
+              /// Patch M (v16): which fallback face produced each glyph id that the
+              /// pipeline had to substitute, keyed by the font object's [GlyphKey]. An id
+              /// that two different faces produced is dropped again, which makes it
+              /// ambiguous and therefore unredirectable.
+              glyph_faces: HashMap<(GlyphKey, u16), GlyphFace>,
+          }
+          '''
+          
+          UI_FONT_OLD_IMPL_HEAD = r'''impl State {
+              fn get_font_by_kind(&mut self, font_kind: FontKind) -> &Font {
+          '''
+          
+          UI_FONT_NEW_IMPL_HEAD = r'''impl State {
+              /// Patch M (v16): the cached face for a fallback script and weight. The
+              /// selection mirrors the branches inside [get_font]; both read the same four
+              /// cached fields, and the *classification* has exactly one definition above.
+              pub(crate) fn fallback_face(&mut self, script: FallbackScript, bold: bool) -> &Font {
+                  match (script, bold) {
+                      (FallbackScript::Cjk, true) => {
+                          self.sans_bold_zh.get_or_insert_with(Font::sans_bold_zh)
+                      }
+                      (FallbackScript::Cjk, false) => self
+                          .sans_regular_zh
+                          .get_or_insert_with(Font::sans_regular_zh),
+                      (FallbackScript::Arabic, true) => {
+                          self.sans_bold_ar.get_or_insert_with(Font::sans_bold_ar)
+                      }
+                      (FallbackScript::Arabic, false) => self
+                          .sans_regular_ar
+                          .get_or_insert_with(Font::sans_regular_ar),
+                  }
+              }
+          
+              /// Patch M (v16): record that `glyph_id` came out of `face` for this font
+              /// object. A conflicting record removes the entry instead of picking a
+              /// winner: an ambiguous id must not be redirected, or the wrong glyph would
+              /// be drawn.
+              pub(crate) fn note_glyph_face(&mut self, key: GlyphKey, glyph_id: u16, face: GlyphFace) {
+                  match self.glyph_faces.get(&(key, glyph_id)) {
+                      Some(existing) if *existing != face => {
+                          self.glyph_faces.remove(&(key, glyph_id));
+                      }
+                      Some(_) => {}
+                      None => {
+                          self.glyph_faces.insert((key, glyph_id), face);
+                      }
+                  }
+              }
+          
+              /// Patch M (v16): the glyph id for `c` from the face that can draw it, or
+              /// `None` when there is nothing to substitute. The id is recorded, so the
+              /// drawing side can use the face that produced it.
+              pub(crate) fn fallback_glyph_id(
+                  &mut self,
+                  key: GlyphKey,
+                  script: FallbackScript,
+                  bold: bool,
+                  c: u16,
+              ) -> Option<u16> {
+                  let id = {
+                      let face = self.fallback_face(script, bold);
+                      face.glyph_id_for_char(c).0
+                  };
+                  if id == 0 {
+                      // The fallback face cannot draw it either: keep the caller's id (0,
+                      // i.e. .notdef) rather than inventing one.
+                      return None;
+                  }
+                  self.note_glyph_face(key, id, GlyphFace { script, bold });
+                  Some(id)
+              }
+          
+              /// Patch M (v16): the face that produced *every* id in a run, or `None` when
+              /// the run has to keep the font the caller selected. All-or-nothing, so an
+              /// id from another font is never drawn with this face.
+              pub(crate) fn glyph_run_face(&self, key: GlyphKey, glyph_ids: &[u16]) -> Option<GlyphFace> {
+                  let mut face: Option<GlyphFace> = None;
+                  for glyph_id in glyph_ids {
+                      let candidate = self.glyph_faces.get(&(key, *glyph_id)).copied()?;
+                      match face {
+                          None => face = Some(candidate),
+                          Some(previous) if previous == candidate => {}
+                          Some(_) => return None,
+                      }
+                  }
+                  face
+              }
+          
+              fn get_font_by_kind(&mut self, font_kind: FontKind) -> &Font {
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 2. uikit.rs: expose the registry through the shared state
+          # --------------------------------------------------------------------------
+          
+          UIKIT_OLD = r'''        ui_font::get_font(&mut self.ui_font, kind, text)
+              }
+          }
+          '''
+          
+          UIKIT_NEW = r'''        ui_font::get_font(&mut self.ui_font, kind, text)
+              }
+          
+              /// Patch M (v16): the glyph-fallback registry, reached from the CoreText and
+              /// CoreGraphics glyph pipeline through the state that owns the cached faces.
+              pub(crate) fn fallback_glyph_id(
+                  &mut self,
+                  key: ui_font::GlyphKey,
+                  script: ui_font::FallbackScript,
+                  bold: bool,
+                  c: u16,
+              ) -> Option<u16> {
+                  self.ui_font.fallback_glyph_id(key, script, bold, c)
+              }
+          
+              /// Patch M (v16): whether every glyph id in a run came from one fallback
+              /// face. `&self`, because reading the registry must not keep the state
+              /// mutably borrowed while the context font is borrowed.
+              pub(crate) fn glyph_run_face(
+                  &self,
+                  key: ui_font::GlyphKey,
+                  glyph_ids: &[u16],
+              ) -> Option<ui_font::GlyphFace> {
+                  self.ui_font.glyph_run_face(key, glyph_ids)
+              }
+          
+              /// Patch M (v16): the cached face for a face recorded earlier.
+              pub(crate) fn face_for(&mut self, face: ui_font::GlyphFace) -> &crate::font::Font {
+                  self.ui_font.fallback_face(face.script, face.bold)
+              }
+          }
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 3. core_text.rs: CTFontGetGlyphsForCharacters
+          # --------------------------------------------------------------------------
+          
+          CORE_TEXT_OLD_CTLINE = r'''    let font_obj = env.framework_state.uikit.font_for_text(font_kind, &text_str);
+              let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+          '''
+          
+          CORE_TEXT_NEW_CTLINE = r'''    let font_obj = env.framework_state.uikit.font_for_text(font_kind, &text_str);
+              // Patch M (v16): the CoreText entry that rasterises a line. `font_obj` comes
+              // from the CJK-aware lookup, so one line covers the measurement and the paint
+              // this entry does with it; `notdef=` is how a device log tells a line drawn
+              // with the Noto face from one drawn with a Latin font's `.notdef` box.
+              static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              let draw_font_label =
+                  crate::frameworks::uikit::ui_font::face_label(None, Some(font_kind), &text_str);
+              crate::frameworks::uikit::ui_font::note_draw_font(
+                  &DRAWFONT_CALLS,
+                  "core_text::CTLineDraw",
+                  "draw",
+                  font_obj,
+                  &text_str,
+                  &draw_font_label,
+                  None,
+              );
+              let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+          '''
+          
+          CORE_TEXT_OLD = r'''    let mut all_mapped = true;
+              for i in 0..count as u32 {
+                  let c: unichar = env.mem.read(characters + i);
+                  let glyph_id = font_obj.glyph_id_for_char(c);
+                  let g = glyph_id.0;
+                  if g == 0 {
+                      all_mapped = false;
+                  }
+                  env.mem.write(glyphs + i, g);
+              }
+              all_mapped
+          }
+          '''
+          
+          CORE_TEXT_NEW = r'''    // Patch M (v16): this is where characters become glyph ids for the
+              // CoreText/CoreGraphics pipeline, so this is where the CJK/Arabic fallback
+              // has to be applied - and where the ids it produces have to be recorded, so
+              // that `CGContextShowGlyphs*` draws them with the face that made them. A
+              // glyph id means nothing on its own: the same number is a different glyph in
+              // another font, which is why substituting ids without recording the face
+              // would replace empty boxes with the wrong glyphs.
+              let space = crate::frameworks::uikit::ui_font::glyph_space_for_uifont(env, ui_font);
+              let mut all_mapped = true;
+              let mut cjk_chars = 0usize;
+              let mut arabic_chars = 0usize;
+              let mut base_notdef = 0usize;
+              let mut substituted = 0usize;
+              let mut notdef_out = 0usize;
+              for i in 0..count as u32 {
+                  let c: unichar = env.mem.read(characters + i);
+                  let script = crate::frameworks::uikit::ui_font::fallback_for_char(c as u32);
+                  match script {
+                      Some(crate::frameworks::uikit::ui_font::FallbackScript::Cjk) => cjk_chars += 1,
+                      Some(crate::frameworks::uikit::ui_font::FallbackScript::Arabic) => arabic_chars += 1,
+                      None => {}
+                  }
+                  let mut g = font_obj.glyph_id_for_char(c).0;
+                  if g == 0 {
+                      base_notdef += 1;
+                      // Rule 1 of the registry: only a character the caller's own font
+                      // cannot draw is replaced. A font that can draw it keeps its glyph.
+                      if let Some(script) = script {
+                          if let Some(fallback_id) = env.framework_state.uikit.fallback_glyph_id(
+                              space.key,
+                              script,
+                              space.bold,
+                              c,
+                          ) {
+                              g = fallback_id;
+                              substituted += 1;
+                          }
+                      }
+                      // The return value keeps the meaning it has on iOS for the font the
+                      // caller passed in: it reports whether *that* font covered the
+                      // string. Repairing the ids must not change an app's control flow,
+                      // only what is drawn if it draws anyway.
+                      all_mapped = false;
+                  }
+                  if g == 0 {
+                      notdef_out += 1;
+                  }
+                  env.mem.write(glyphs + i, g);
+              }
+              // Patch M (v16): unconditional and rate limited (first 40 calls, then every
+              // 200th), so that the *absence* of this line in a device log proves the app
+              // never maps glyphs through CoreText, and one line shows exactly what was
+              // requested and what came back.
+              {
+                  static CTFONTGLYPHS_CALLS: std::sync::atomic::AtomicUsize =
+                      std::sync::atomic::AtomicUsize::new(0);
+                  if crate::frameworks::uikit::ui_font::glyph_log_due(&CTFONTGLYPHS_CALLS) {
+                      log!(
+                          "CTFONTGLYPHS ctfont=0x{:08x} key={:?} chars={} cjk={} arabic={} base_notdef={} substituted={} notdef_out={} all_mapped={}",
+                          font.to_bits(),
+                          space.key,
+                          count,
+                          cjk_chars,
+                          arabic_chars,
+                          base_notdef,
+                          substituted,
+                          notdef_out,
+                          all_mapped
+                      );
+                  }
+              }
+              all_mapped
+          }
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 3b. ns_string.rs: the NSString drawing entry points
+          # --------------------------------------------------------------------------
+          
+          NS_STRING = "src/frameworks/foundation/ns_string.rs"
+          
+          
+          def ns_string_site(entry, old, tail, font_expr, text_expr, declare_text=False):
+              """Trace the face an `NSString` drawing entry is about to draw with.
+          
+              `old` is the entry's body as it stands and `tail` its delegation, which stays
+              last. The face comes from `note_draw_font_for`, i.e. from the same CJK-aware
+              lookup the entry's target uses, so this is a label and not a second selection.
+              The one-argument forwarders get the string read for them (`declare_text`).
+              """
+              trace = (
+                  "    // Patch M (v16): name the face this entry is about to draw with, and the\n"
+                  "    // characters it cannot draw with it, before it delegates.\n"
+                  "    {{\n"
+                  "        static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =\n"
+                  "            std::sync::atomic::AtomicUsize::new(0);\n"
+                  "        ui_font::note_draw_font_for(\n"
+                  "            &DRAWFONT_CALLS,\n"
+                  "            env,\n"
+                  '            "{}",\n'
+                  "            {},\n"
+                  "            {},\n"
+                  "        );\n"
+                  "    }}\n"
+              ).format(entry, font_expr, text_expr)
+              if not old.endswith(tail):
+                  fail("the {} entry does not end with its delegation".format(entry))
+              head = old[: -len(tail)]
+              if declare_text:
+                  head += "    let text = to_rust_string(env, this);\n"
+              return (old, head + trace + tail, "the {} drawing entry".format(entry))
+          
+          
+          NS_STRING_OLD_DRAW_AT_POINT = '''- (CGSize)drawAtPoint:(CGPoint)point withFont:(id)font {
+              let text = to_rust_string(env, this);
+              ui_font::draw_at_point(env, font, &text, point, None)
+          }
+          '''
+          
+          NS_STRING_OLD_DRAW_AT_POINT_WIDTH = '''- (CGSize)drawAtPoint:(CGPoint)point forWidth:(CGFloat)width withFont:(id)font lineBreakMode:(UILineBreakMode)line_break_mode {
+              let text = to_rust_string(env, this);
+              ui_font::draw_at_point(env, font, &text, point, Some((width, line_break_mode)))
+          }
+          '''
+          
+          NS_STRING_OLD_DRAW_AT_POINT_SIZED = '''    let scaled_font: id = msg![env; font fontWithSize:font_size];
+              let text = to_rust_string(env, this);
+              ui_font::draw_at_point(env, scaled_font, &text, point, Some((width, line_break_mode)))
+          }
+          '''
+          
+          NS_STRING_OLD_DRAW_IN_RECT = '''- (CGSize)drawInRect:(CGRect)rect withFont:(id)font {
+              msg![env; this drawInRect:rect withFont:font lineBreakMode:UILineBreakModeWordWrap alignment:UITextAlignmentLeft]
+          }
+          '''
+          
+          NS_STRING_OLD_DRAW_IN_RECT_MODE = '''- (CGSize)drawInRect:(CGRect)rect withFont:(id)font lineBreakMode:(UILineBreakMode)line_break_mode {
+              msg![env; this drawInRect:rect withFont:font lineBreakMode:line_break_mode alignment:UITextAlignmentLeft]
+          }
+          '''
+          
+          NS_STRING_OLD_DRAW_IN_RECT_MODE_ALIGN = '''- (CGSize)drawInRect:(CGRect)rect withFont:(id)font lineBreakMode:(UILineBreakMode)line_break_mode alignment:(UITextAlignment)align {
+              let text = to_rust_string(env, this);
+              ui_font::draw_in_rect(env, font, &text, rect, line_break_mode, align)
+          }
+          '''
+          
+          NS_STRING_SITES = [
+              ns_string_site("ns_string::drawAtPoint:withFont:",
+                             NS_STRING_OLD_DRAW_AT_POINT,
+                             "    ui_font::draw_at_point(env, font, &text, point, None)\n}\n",
+                             "font", "&text"),
+              ns_string_site("ns_string::drawAtPoint:forWidth:withFont:lineBreakMode:",
+                             NS_STRING_OLD_DRAW_AT_POINT_WIDTH,
+                             "    ui_font::draw_at_point(env, font, &text, point, Some((width, line_break_mode)))\n}\n",
+                             "font", "&text"),
+              ns_string_site(
+                  "ns_string::drawAtPoint:forWidth:withFont:fontSize:lineBreakMode:baselineAdjustment:",
+                  NS_STRING_OLD_DRAW_AT_POINT_SIZED,
+                  "    ui_font::draw_at_point(env, scaled_font, &text, point, Some((width, line_break_mode)))\n}\n",
+                  "scaled_font", "&text"),
+              ns_string_site("ns_string::drawInRect:withFont:",
+                             NS_STRING_OLD_DRAW_IN_RECT,
+                             "    msg![env; this drawInRect:rect withFont:font lineBreakMode:UILineBreakModeWordWrap alignment:UITextAlignmentLeft]\n}\n",
+                             "font", "&text", declare_text=True),
+              ns_string_site("ns_string::drawInRect:withFont:lineBreakMode:",
+                             NS_STRING_OLD_DRAW_IN_RECT_MODE,
+                             "    msg![env; this drawInRect:rect withFont:font lineBreakMode:line_break_mode alignment:UITextAlignmentLeft]\n}\n",
+                             "font", "&text", declare_text=True),
+              ns_string_site("ns_string::drawInRect:withFont:lineBreakMode:alignment:",
+                             NS_STRING_OLD_DRAW_IN_RECT_MODE_ALIGN,
+                             "    ui_font::draw_in_rect(env, font, &text, rect, line_break_mode, align)\n}\n",
+                             "font", "&text"),
+          ]
+          
+          # --------------------------------------------------------------------------
+          # 4. cg_font.rs: the CGFontHostObject key and CGFontGetGlyphsForUnichars
+          # --------------------------------------------------------------------------
+          
+          CG_FONT_OLD_STRUCT = r'''#[derive(Default)]
+          pub struct CGFontHostObject {
+              pub font: Font,
+          }
+          '''
+          
+          CG_FONT_NEW_STRUCT = r'''#[derive(Default)]
+          pub struct CGFontHostObject {
+              pub font: Font,
+              /// Patch M (v16): which namespace this font's glyph ids live in, so the
+              /// drawing side can find the face that produced them. `None` for a font made
+              /// from the app's own data that has not produced any ids yet.
+              pub(crate) glyph_key: Option<crate::frameworks::uikit::ui_font::GlyphKey>,
+          }
+          '''
+          
+          CG_FONT_OLD_CTOR = r'''    let host_obj = Box::new(CGFontHostObject { font });
+          '''
+          
+          CG_FONT_NEW_CTOR = r'''    // Patch M (v16): a font built from the app's own data has no UIFont kind to
+              // consult, so its ids are keyed by the object itself.
+              let host_obj = Box::new(CGFontHostObject { font, glyph_key: None });
+          '''
+          
+          CG_FONT_OLD_MAPPER = r'''    let mut all_mapped = true;
+              for i in 0..length {
+                  let c: unichar = env.mem.read(chars + i);
+                  let glyph_id = env
+                      .objc
+                      .borrow::<CGFontHostObject>(font)
+                      .font
+                      .glyph_id_for_char(c);
+                  let g = glyph_id.0;
+                  if g == 0 {
+                      all_mapped = false;
+                  }
+                  env.mem.write(glyphs + i, g);
+              }
+              all_mapped
+          }
+          '''
+          
+          CG_FONT_NEW_MAPPER = r'''    // Patch M (v16): the CGFont-side counterpart of the mapping in
+              // CTFontGetGlyphsForCharacters. A character this font cannot draw that needs
+              // CJK/Arabic comes from the fallback face instead, and the id is recorded so
+              // `CGContextShowGlyphs*` draws it with that face. There is no UIFont kind
+              // here, so the ids are keyed by this object and the regular-weight face is
+              // the only choice.
+              let key = crate::frameworks::uikit::ui_font::GlyphKey::Object(font.to_bits() as usize);
+              let mut all_mapped = true;
+              let mut cjk_chars = 0usize;
+              let mut arabic_chars = 0usize;
+              let mut base_notdef = 0usize;
+              let mut substituted = 0usize;
+              let mut notdef_out = 0usize;
+              for i in 0..length {
+                  let c: unichar = env.mem.read(chars + i);
+                  let script = crate::frameworks::uikit::ui_font::fallback_for_char(c as u32);
+                  match script {
+                      Some(crate::frameworks::uikit::ui_font::FallbackScript::Cjk) => cjk_chars += 1,
+                      Some(crate::frameworks::uikit::ui_font::FallbackScript::Arabic) => arabic_chars += 1,
+                      None => {}
+                  }
+                  let mut g = env
+                      .objc
+                      .borrow::<CGFontHostObject>(font)
+                      .font
+                      .glyph_id_for_char(c)
+                      .0;
+                  if g == 0 {
+                      base_notdef += 1;
+                      all_mapped = false;
+                      // Only a character this font cannot draw is replaced.
+                      if let Some(script) = script {
+                          if let Some(fallback_id) =
+                              env.framework_state
+                                  .uikit
+                                  .fallback_glyph_id(key, script, false, c)
+                          {
+                              g = fallback_id;
+                              substituted += 1;
+                          }
+                      }
+                  }
+                  if g == 0 {
+                      notdef_out += 1;
+                  }
+                  env.mem.write(glyphs + i, g);
+              }
+              // Patch M (v16): unconditional and rate limited, exactly like
+              // CTFONTGLYPHS: no line in a device log means this path is never used.
+              {
+                  static CGFONTGLYPHS_CALLS: std::sync::atomic::AtomicUsize =
+                      std::sync::atomic::AtomicUsize::new(0);
+                  if crate::frameworks::uikit::ui_font::glyph_log_due(&CGFONTGLYPHS_CALLS) {
+                      log!(
+                          "CGFONTGLYPHS font=0x{:08x} key={:?} chars={} cjk={} arabic={} base_notdef={} substituted={} notdef_out={} all_mapped={}",
+                          font.to_bits(),
+                          key,
+                          length,
+                          cjk_chars,
+                          arabic_chars,
+                          base_notdef,
+                          substituted,
+                          notdef_out,
+                          all_mapped
+                      );
+                  }
+              }
+              all_mapped
+          }
+          '''
+          
+          # --------------------------------------------------------------------------
+          # 5. cg_context.rs: the key on the context font and the redirect on the draws
+          # --------------------------------------------------------------------------
+          
+          # The three Core Graphics text entry points are **not** touched. They are empty
+          # stubs in this tree and the app under test does not call them (nothing in the
+          # device log came from them, and the boxed text *was* measured), so v15's "the
+          # stubs must stay empty" assertion still holds and this patch does not supersede
+          # it. The three bodies below are the tree's own text, and the post-conditions
+          # check that they are still there verbatim after the patch has run.
+          CG_CONTEXT_STUB_SELECT_FONT = '''fn CGContextSelectFont(
+              _env: &mut Environment,
+              _context: CGContextRef,
+              _name: crate::mem::ConstPtr<u8>,
+              _size: CGFloat,
+              _encoding: i32,
+          ) {
+          }
+          '''
+          
+          CG_CONTEXT_STUB_SHOW_TEXT_AT_POINT = '''fn CGContextShowTextAtPoint(
+              _env: &mut Environment,
+              _context: CGContextRef,
+              _x: CGFloat,
+              _y: CGFloat,
+              _string: crate::mem::ConstPtr<u8>,
+              _length: u32,
+          ) {
+          }
+          '''
+          
+          CG_CONTEXT_STUB_SHOW_TEXT = '''fn CGContextShowText(
+              _env: &mut Environment,
+              _context: CGContextRef,
+              _string: crate::mem::ConstPtr<u8>,
+              _length: u32,
+          ) {
+          }
+          '''
+          
+          CG_CONTEXT_TEXT_STUBS = (
+              CG_CONTEXT_STUB_SELECT_FONT,
+              CG_CONTEXT_STUB_SHOW_TEXT_AT_POINT,
+              CG_CONTEXT_STUB_SHOW_TEXT,
+          )
+          
+          CG_CONTEXT_OLD_CTOR_UIKIT = r'''        if let Some(f) = uikit::ui_font::font_from_uifont(env, font) {
+                      let host_obj = Box::new(CGFontHostObject { font: f });
+          '''
+          
+          CG_CONTEXT_NEW_CTOR_UIKIT = r'''        if let Some(f) = uikit::ui_font::font_from_uifont(env, font) {
+                      // Patch M (v16): remember which face this CGFont was made from, so
+                      // the glyph ids that UIFont produced can be traced back to it when
+                      // they are drawn. Keyed by kind, not by address: CoreText's
+                      // CTFontCopyGraphicsFont hands out a different UIFont object for the
+                      // same face.
+                      let glyph_key = uikit::ui_font::glyph_space_for_uifont(env, font).key;
+                      let host_obj = Box::new(CGFontHostObject {
+                          font: f,
+                          glyph_key: Some(glyph_key),
+                      });
+          '''
+          
+          CG_CONTEXT_OLD_CTOR_FALLBACK = r'''        let host_obj = Box::new(CGFontHostObject { font: crate::font::Font::sans_regular() });
+          '''
+          
+          CG_CONTEXT_NEW_CTOR_FALLBACK = r'''        // Patch M (v16): Liberation Sans is a known face, so the ids this font
+                  // produces belong to that face's namespace.
+                  let glyph_key = uikit::ui_font::GlyphKey::Kind(uikit::ui_font::FontKind::SansRegular);
+                  let host_obj = Box::new(CGFontHostObject {
+                      font: crate::font::Font::sans_regular(),
+                      glyph_key: Some(glyph_key),
+                  });
+          '''
+          
+          CG_CONTEXT_OLD_NOTDEF_HELPER = r'''/// Rate-limited diagnostic for the glyph-id text entry points.
+          '''
+          
+          CG_CONTEXT_NEW_NOTDEF_HELPER = r'''/// Patch M (v16): unconditional, rate-limited trace of the glyph-id drawing
+          /// entry points (first 40 calls, then one line every 200), naming the context's
+          /// font, the ids it is asked to draw, how many of them are `.notdef`, and which
+          /// face they will be drawn with.
+          ///
+          /// This is deliberately not limited to CJK or `.notdef` runs: a trace that only
+          /// fires for a suspicious run cannot tell "the app never draws text this way"
+          /// from "it does and the run is clean", and that is the question a device log
+          /// has to settle.
+          fn note_glyph_run(
+              env: &mut Environment,
+              context: CGContextRef,
+              entry: &str,
+              font: CGFontRef,
+              glyph_ids: &[rusttype::GlyphId],
+              run_face: Option<uikit::ui_font::GlyphFace>,
+          ) {
+              static CGGLYPHS_CALLS: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              if !uikit::ui_font::glyph_log_due(&CGGLYPHS_CALLS) {
+                  return;
+              }
+              let notdef = glyph_ids.iter().filter(|id| id.0 == 0).count();
+              let sample: Vec<u16> = glyph_ids.iter().take(8).map(|id| id.0).collect();
+              let glyph_key = env.objc.borrow::<CGFontHostObject>(font).glyph_key;
+              let font_size = env.objc.borrow::<CGContextHostObject>(context).font_size;
+              log!(
+                  "CGGLYPHS {} font=0x{:08x} key={:?} size={} n={} notdef={} ids={:?} draw_with={:?}",
+                  entry,
+                  font.to_bits(),
+                  glyph_key,
+                  font_size,
+                  glyph_ids.len(),
+                  notdef,
+                  sample,
+                  run_face
+              );
+          }
+          
+          /// Rate-limited diagnostic for the glyph-id text entry points.
+          '''
+          
+          
+          def glyph_site(entry, old, new):
+              """The per-entry-point edit: look the run up in the registry and log it."""
+              return (old, new, "the {} glyph loop".format(entry))
+          
+          
+          CG_CONTEXT_OLD_AT_POINT_CALL = (
+              '    note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPoint");\n'
+          )
+          CG_CONTEXT_OLD_AT_POSITIONS_CALL = (
+              '    note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPositions");\n'
+          )
+          CG_CONTEXT_OLD_WITH_ADVANCES_CALL = (
+              '    note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsWithAdvances");\n'
+          )
+          
+          
+          def redirect_block(entry):
+              return '''    // Patch M (v16): a glyph id is only meaningful in the namespace of the font
+              // that produced it. Every id in this run was produced by one and the same
+              // fallback face (the character-to-id step recorded each of them, and only
+              // substituted characters the caller's own font could not draw), so the run is
+              // drawn with that face. A run that contains any other id - one from another
+              // font, or one this registry has no record for - keeps the context font: ids
+              // are never drawn with a face that did not produce them.
+              let glyph_ids_u16: Vec<u16> = glyph_ids.iter().map(|id| id.0).collect();
+              let glyph_key = env
+                  .objc
+                  .borrow::<CGFontHostObject>(font)
+                  .glyph_key
+                  .unwrap_or(uikit::ui_font::GlyphKey::Object(font.to_bits() as usize));
+              let run_face = env
+                  .framework_state
+                  .uikit
+                  .glyph_run_face(glyph_key, &glyph_ids_u16);
+              note_glyph_run(env, context, "@ENTRY@", font, &glyph_ids, run_face);
+          '''.replace("@ENTRY@", entry)
+          
+          
+          def draw_font_site(entry, draw_call):
+              """Resolve the face that rasterises a run, and trace it before it does.
+          
+              The DRAWFONT line goes at the call that produces the pixels, with the face that
+              call is handed: the recorded fallback face when every id in the run came from
+              one, the context font otherwise. The ids themselves are the whole of what this
+              entry knows - it is handed ids, not characters - so `text` is empty and
+              `notdef` counts the ids that are `.notdef` in that face.
+              """
+              old = (
+                  "    let rusttype_font = &env.objc.borrow::<CGFontHostObject>(font).font;\n"
+                  "    rusttype_font.{}(\n".format(draw_call)
+              )
+              new = '''    // Patch M (v16): the face this run was recorded with, or the context font.
+              let rusttype_font = match run_face {
+                  Some(face) => env.framework_state.uikit.face_for(face),
+                  None => &env.objc.borrow::<CGFontHostObject>(font).font,
+              };
+              // Patch M (v16): this is the call that rasterises the run, so this is where
+              // DRAWFONT names the face that does it and says how many of the ids it is
+              // about to draw are `.notdef` in that face.
+              static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =
+                  std::sync::atomic::AtomicUsize::new(0);
+              let draw_font_label = match (run_face, glyph_key) {
+                  (Some(face), _) => uikit::ui_font::face_label(Some(face), None, ""),
+                  (None, uikit::ui_font::GlyphKey::Kind(kind)) => {
+                      uikit::ui_font::face_label(None, Some(kind), "")
+                  }
+                  (None, _) => uikit::ui_font::face_label(None, None, ""),
+              };
+              uikit::ui_font::note_draw_font(
+                  &DRAWFONT_CALLS,
+                  "cg_context::@ENTRY@",
+                  "draw",
+                  rusttype_font,
+                  "",
+                  &draw_font_label,
+                  Some(&glyph_ids_u16),
+              );
+              rusttype_font.@DRAW@(
+          '''.replace("@ENTRY@", entry).replace("@DRAW@", draw_call)
+              return (old, new, "the {} draw-font lookup and its DRAWFONT line".format(entry))
+          
+          
+          CG_CONTEXT_DRAW_SITES = (
+              ("CGContextShowGlyphsAtPoint", "draw_glyphs"),
+              ("CGContextShowGlyphsAtPositions", "draw_glyphs_at_positions"),
+              ("CGContextShowGlyphsWithAdvances", "draw_glyphs_with_advances"),
+          )
+          
+          
+          # Post-conditions per file: (marker, expected count).
+          POSTCONDITIONS = {
+              UI_FONT: (
+                  (PATCH_MARKER, -1),
+                  ("pub(crate) enum FallbackScript {", 1),
+                  ("pub(crate) fn fallback_for_char(c: u32) -> Option<FallbackScript> {", 1),
+                  ("pub(crate) enum GlyphKey {", 1),
+                  ("pub(crate) struct GlyphFace {", 1),
+                  ("pub(crate) struct UIFontGlyphSpace {", 1),
+                  ("pub(crate) fn glyph_space_for_uifont(", 1),
+                  ("pub(crate) fn glyph_log_due(counter: &std::sync::atomic::AtomicUsize) -> bool {", 1),
+                  ("pub(crate) fn font_kind_is_bold(kind: FontKind) -> bool {", 1),
+                  ("    glyph_faces: HashMap<(GlyphKey, u16), GlyphFace>,", 1),
+                  ("pub(crate) fn fallback_face(&mut self, script: FallbackScript, bold: bool) -> &Font {", 1),
+                  ("pub(crate) fn note_glyph_face(&mut self, key: GlyphKey, glyph_id: u16, face: GlyphFace) {", 1),
+                  ("pub(crate) fn fallback_glyph_id(", 1),
+                  ("pub(crate) fn glyph_run_face(&self, key: GlyphKey, glyph_ids: &[u16]) -> Option<GlyphFace> {", 1),
+                  # the DRAWFONT trace and the label it prints
+                  ("pub(crate) fn face_label(face: Option<GlyphFace>, kind: Option<FontKind>, text: &str) -> String {", 1),
+                  ("fn glyph_id_unit(font: &Font, c: char) -> u16 {", 1),
+                  ("pub(crate) fn draw_log_due(counter: &std::sync::atomic::AtomicUsize) -> bool {", 1),
+                  ("call <= 60 || call % 200 == 0", 1),
+                  ("pub(crate) fn note_draw_font(", 1),
+                  ("pub(crate) fn note_draw_font_for(", 1),
+                  ('"DRAWFONT entry={} phase={} text=\\"{}\\" cjk={} font={} notdef={} chars={} cps=[{}] gids=[{}]",', 1),
+                  ("        .map(|c| format!(\"U+{:04X}\", c as u32))", 1),
+                  # both phases of the two UIKit drawing entries, each with its own counter
+                  ('"ui_font::draw_at_point",', 2),
+                  ('"ui_font::draw_in_rect",', 2),
+                  ("static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =", 2),
+                  ("    font.draw(\n        host_object.size,\n        text,\n        (point.x, point.y),", 1),
+                  ("    font.draw(\n        host_object.size,\n        text,\n        (rect.origin.x + origin_x_offset, rect.origin.y),", 1),
+                  # an entry that is not a drawing entry gets no line
+                  ("fn is_cjk_text(", 0),
+                  ("font_kind_for_name", 0),
+                  # the classification itself is untouched, and there is still exactly one
+                  ("fn is_cjk_char(c: u32) -> bool {", 1),
+                  ("fn is_arabic_char(c: u32) -> bool {", 1),
+                  ("if is_cjk_char(c) {", 1),
+                  ("} else if is_arabic_char(c) {", 1),
+                  # patch L's contract: one definition, one entry point
+                  ("pub(crate) fn get_font<'a>(state: &'a mut State", 1),
+                  ("get_font_by_kind(", 7),
+                  # the pre-patch forms of the two helpers this patch widens
+                  ("\nfn font_kind_is_bold(kind: FontKind) -> bool {", 0),
+              ),
+              UIKIT: (
+                  (PATCH_MARKER, -1),
+                  ("pub(crate) fn fallback_glyph_id(", 1),
+                  ("pub(crate) fn glyph_run_face(", 1),
+                  ("pub(crate) fn face_for(&mut self, face: ui_font::GlyphFace) -> &crate::font::Font {", 1),
+                  # patch L's accessor stays exactly as it was
+                  ("ui_font::get_font(&mut self.ui_font, kind, text)", 1),
+              ),
+              CORE_TEXT: (
+                  (PATCH_MARKER, -1),
+                  ("let space = crate::frameworks::uikit::ui_font::glyph_space_for_uifont(env, ui_font);", 1),
+                  ("fallback_glyph_id(", 1),
+                  ("\"CTFONTGLYPHS ctfont=0x{:08x} key={:?} chars={} cjk={} arabic={} base_notdef={} substituted={} notdef_out={} all_mapped={}\",", 1),
+                  ("static CTFONTGLYPHS_CALLS: std::sync::atomic::AtomicUsize =", 1),
+                  ("crate::frameworks::uikit::ui_font::glyph_log_due(&CTFONTGLYPHS_CALLS)", 1),
+                  ('"core_text::CTLineDraw",', 1),
+                  ("crate::frameworks::uikit::ui_font::note_draw_font(", 1),
+                  ("crate::frameworks::uikit::ui_font::face_label(None, Some(font_kind), &text_str)", 1),
+                  ("static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =", 1),
+                  ('"draw",', 1),
+                  # patch L's markers in this function have to survive (its self-check pins
+                  # them): the base face, and no `font_for_text` in the glyph mapper
+                  ("let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);", 1),
+                  ("env.framework_state.uikit.font_for_text(font_kind, &text_str);", 4),
+                  # one implementation of the classification, still none in this file
+                  ("fn is_cjk_char(", 0),
+                  ("is_cjk_char(", 0),
+                  ("is_arabic_char(", 0),
+              ),
+              NS_STRING: (
+                  # one marker per entry that was traced
+                  (PATCH_MARKER, 6),
+                  ("ui_font::note_draw_font_for(", 6),
+                  ("static DRAWFONT_CALLS: std::sync::atomic::AtomicUsize =", 6),
+                  ('"ns_string::drawAtPoint:withFont:",', 1),
+                  ('"ns_string::drawAtPoint:forWidth:withFont:lineBreakMode:",', 1),
+                  ('"ns_string::drawAtPoint:forWidth:withFont:fontSize:lineBreakMode:baselineAdjustment:",', 1),
+                  ('"ns_string::drawInRect:withFont:",', 1),
+                  ('"ns_string::drawInRect:withFont:lineBreakMode:",', 1),
+                  ('"ns_string::drawInRect:withFont:lineBreakMode:alignment:",', 1),
+                  # what each entry did before is still there, once
+                  ("ui_font::draw_at_point(env, font, &text, point, None)", 1),
+                  ("ui_font::draw_at_point(env, font, &text, point, Some((width, line_break_mode)))", 1),
+                  ("ui_font::draw_at_point(env, scaled_font, &text, point, Some((width, line_break_mode)))", 1),
+                  ("ui_font::draw_in_rect(env, font, &text, rect, line_break_mode, align)", 1),
+                  ("msg![env; this drawInRect:rect withFont:font lineBreakMode:UILineBreakModeWordWrap alignment:UITextAlignmentLeft]", 1),
+                  ("msg![env; this drawInRect:rect withFont:font lineBreakMode:line_break_mode alignment:UITextAlignmentLeft]", 1),
+              ),
+              CG_FONT: (
+                  (PATCH_MARKER, -1),
+                  ("pub(crate) glyph_key: Option<crate::frameworks::uikit::ui_font::GlyphKey>,", 1),
+                  ("let host_obj = Box::new(CGFontHostObject { font, glyph_key: None });", 1),
+                  ("let key = crate::frameworks::uikit::ui_font::GlyphKey::Object(font.to_bits() as usize);", 1),
+                  ("fallback_glyph_id(key, script, false, c)", 1),
+                  ("\"CGFONTGLYPHS font=0x{:08x} key={:?} chars={} cjk={} arabic={} base_notdef={} substituted={} notdef_out={} all_mapped={}\",", 1),
+                  ("static CGFONTGLYPHS_CALLS: std::sync::atomic::AtomicUsize =", 1),
+                  ("fn is_cjk_char(", 0),
+                  ("is_cjk_char(", 0),
+              ),
+              CG_CONTEXT: (
+                  (PATCH_MARKER, -1),
+                  ("fn note_glyph_run(", 1),
+                  ("let glyph_key = uikit::ui_font::glyph_space_for_uifont(env, font).key;", 1),
+                  ("let glyph_key = uikit::ui_font::GlyphKey::Kind(uikit::ui_font::FontKind::SansRegular);", 1),
+                  ("glyph_key: Some(glyph_key),", 2),
+                  (".glyph_run_face(glyph_key, &glyph_ids_u16);", 3),
+                  ("let glyph_ids_u16: Vec<u16> = glyph_ids.iter().map(|id| id.0).collect();", 3),
+                  ("Some(face) => env.framework_state.uikit.face_for(face),", 3),
+                  ("None => &env.objc.borrow::<CGFontHostObject>(font).font,", 3),
+                  ("note_glyph_run(env, context, \"CGContextShowGlyphsAtPoint\", font, &glyph_ids, run_face);", 1),
+                  ("note_glyph_run(env, context, \"CGContextShowGlyphsAtPositions\", font, &glyph_ids, run_face);", 1),
+                  ("note_glyph_run(env, context, \"CGContextShowGlyphsWithAdvances\", font, &glyph_ids, run_face);", 1),
+                  ("\"CGGLYPHS {} font=0x{:08x} key={:?} size={} n={} notdef={} ids={:?} draw_with={:?}\",", 1),
+                  ("if !uikit::ui_font::glyph_log_due(&CGGLYPHS_CALLS) {", 1),
+                  # DRAWFONT at each of the three calls that rasterise a run, with the face
+                  # that call is handed
+                  ('"cg_context::CGContextShowGlyphsAtPoint",', 1),
+                  ('"cg_context::CGContextShowGlyphsAtPositions",', 1),
+                  ('"cg_context::CGContextShowGlyphsWithAdvances",', 1),
+                  ("uikit::ui_font::note_draw_font(", 3),
+                  ("        Some(&glyph_ids_u16),", 3),
+                  # patch L's diagnostics and the drawing calls it pinned have to survive
+                  ('note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPoint");', 1),
+                  ('note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPositions");', 1),
+                  ('note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsWithAdvances");', 1),
+                  ("rusttype_font.draw_glyphs(", 1),
+                  ("rusttype_font.draw_glyphs_at_positions(", 1),
+                  ("rusttype_font.draw_glyphs_with_advances(", 1),
+                  ("uikit::ui_font::face_label(Some(face), None, \"\")", 3),
+                  # the three text entry points are empty stubs in this tree and this patch
+                  # leaves them alone: their parameters are still unused and they still draw
+                  # nothing. Nothing of the rejected "implement the stubs" line is here.
+                  ("    _name: crate::mem::ConstPtr<u8>,", 1),
+                  ("    _string: crate::mem::ConstPtr<u8>,", 2),
+                  ("    _length: u32,", 2),
+                  ("    _size: CGFloat,", 1),
+                  ("    _encoding: i32,", 1),
+                  ("fn CGContextShowTextAtPoint(", 1),
+                  ("fn CGContextShowText(", 1),
+                  ("fn CGContextSelectFont(", 1),
+                  ("select_font_name", 0),
+                  ("select_font_encoding", 0),
+                  ("CGTEXTAPI", 0),
+                  ("cg_show_text", 0),
+                  ("cg_text_bytes", 0),
+                  ("fallback_for_char(character as u32)", 0),
+                  # the old SetFont tail and the pre-patch constructors are back to their
+                  # v15 form, and the old draw-font line is gone
+                  ("    env.objc.borrow_mut::<CGContextHostObject>(context).font = font;", 1),
+                  ("uikit::ui_font::font_from_uifont(env, font)", 1),
+                  ("let host_obj = Box::new(CGFontHostObject { font: f });", 0),
+                  ("let host_obj = Box::new(CGFontHostObject { font: crate::font::Font::sans_regular() });", 0),
+                  ("    let rusttype_font = &env.objc.borrow::<CGFontHostObject>(font).font;\n", 0),
+              ),
+          }
+          
+          # Blocks that must be byte-identical before and after, so that patch L's own
+          # self-check (which pins them) keeps passing, and so that v15's "the three text
+          # entry points must stay empty stubs" assertion keeps holding: the empty stubs
+          # and the mapping function that must keep its own font object's ids out of the
+          # registry.
+          UNTOUCHED = {
+              CORE_TEXT: (
+                  # patch L's `font_from_uifont` base face in the mapper, verbatim
+                  "    let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);\n",
+              ),
+              CG_CONTEXT: CG_CONTEXT_TEXT_STUBS,
+          }
+          
+          
+          def fail(message):
+              print("ERROR: " + message, file=sys.stderr)
+              raise SystemExit(1)
+          
+          
+          def replace_once(text, old, new, what, count=1):
+              found = text.count(old)
+              if found != count:
+                  fail("cannot find {} ({} match(es), expected {}); is the v15 tree in place?".format(
+                      what, found, count))
+              return text.replace(old, new, count)
+          
+          
+          def check(path, text):
+              """Everything that must hold of the patched file."""
+              if text.count("{") != text.count("}"):
+                  fail("{}: unbalanced braces: {} '{{' vs {} '}}'".format(
+                      path, text.count("{"), text.count("}")))
+              for marker, expected in POSTCONDITIONS[path]:
+                  count = text.count(marker)
+                  if expected == -1:
+                      # presence only: the marker count itself is not a contract
+                      if count < 1:
+                          fail("{}: {!r} is missing".format(path, marker))
+                      continue
+                  if count != expected:
+                      fail("{}: {!r} appears {} time(s), expected {}".format(path, marker, count, expected))
+              for block in UNTOUCHED.get(path, ()):
+                  if block not in text:
+                      fail("{}: a block this patch must not touch is missing or was edited:\n{}".format(
+                          path, block))
+          
+          
+          def main():
+              repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+          
+              edits_per_file = {
+                  UI_FONT: [
+                      (UI_FONT_OLD_SHARED, UI_FONT_NEW_SHARED, "the FallbackScript/GlyphKey block"),
+                      (UI_FONT_OLD_STATE_FIELD, UI_FONT_NEW_STATE_FIELD, "the ui_font State fields"),
+                      (UI_FONT_OLD_IMPL_HEAD, UI_FONT_NEW_IMPL_HEAD, "the ui_font State impl head"),
+                      (UI_FONT_OLD_DRAW_AT_POINT, UI_FONT_NEW_DRAW_AT_POINT,
+                       "draw_at_point's measure phase"),
+                      (UI_FONT_OLD_DRAW_CALL_AT_POINT, UI_FONT_NEW_DRAW_CALL_AT_POINT,
+                       "draw_at_point's draw phase"),
+                      (UI_FONT_OLD_DRAW_IN_RECT, UI_FONT_NEW_DRAW_IN_RECT,
+                       "draw_in_rect's measure phase"),
+                      (UI_FONT_OLD_DRAW_CALL_IN_RECT, UI_FONT_NEW_DRAW_CALL_IN_RECT,
+                       "draw_in_rect's draw phase"),
+                  ],
+                  UIKIT: [
+                      (UIKIT_OLD, UIKIT_NEW, "the end of uikit State's font_for_text"),
+                  ],
+                  CORE_TEXT: [
+                      (CORE_TEXT_OLD, CORE_TEXT_NEW, "the CTFontGetGlyphsForCharacters loop"),
+                      (CORE_TEXT_OLD_CTLINE, CORE_TEXT_NEW_CTLINE, "CTLineDraw's DRAWFONT line"),
+                  ],
+                  NS_STRING: list(NS_STRING_SITES),
+                  CG_FONT: [
+                      (CG_FONT_OLD_STRUCT, CG_FONT_NEW_STRUCT, "the CGFontHostObject fields"),
+                      (CG_FONT_OLD_CTOR, CG_FONT_NEW_CTOR, "the CGFontCreateWithDataProvider host object"),
+                      (CG_FONT_OLD_MAPPER, CG_FONT_NEW_MAPPER, "the CGFontGetGlyphsForUnichars loop"),
+                  ],
+                  CG_CONTEXT: [
+                      (CG_CONTEXT_OLD_NOTDEF_HELPER, CG_CONTEXT_NEW_NOTDEF_HELPER, "note_notdef_glyphs' doc"),
+                      (CG_CONTEXT_OLD_CTOR_UIKIT, CG_CONTEXT_NEW_CTOR_UIKIT, "CGContextSetFont's UIFont case"),
+                      (CG_CONTEXT_OLD_CTOR_FALLBACK, CG_CONTEXT_NEW_CTOR_FALLBACK,
+                       "CGContextSetFont's unknown-font case"),
+                      glyph_site("CGContextShowGlyphsAtPoint", CG_CONTEXT_OLD_AT_POINT_CALL,
+                                 CG_CONTEXT_OLD_AT_POINT_CALL + redirect_block("CGContextShowGlyphsAtPoint")),
+                      glyph_site("CGContextShowGlyphsAtPositions", CG_CONTEXT_OLD_AT_POSITIONS_CALL,
+                                 CG_CONTEXT_OLD_AT_POSITIONS_CALL + redirect_block("CGContextShowGlyphsAtPositions")),
+                      glyph_site("CGContextShowGlyphsWithAdvances", CG_CONTEXT_OLD_WITH_ADVANCES_CALL,
+                                 CG_CONTEXT_OLD_WITH_ADVANCES_CALL + redirect_block("CGContextShowGlyphsWithAdvances")),
+                      draw_font_site("CGContextShowGlyphsAtPoint", "draw_glyphs"),
+                      draw_font_site("CGContextShowGlyphsAtPositions", "draw_glyphs_at_positions"),
+                      draw_font_site("CGContextShowGlyphsWithAdvances", "draw_glyphs_with_advances"),
+                  ],
+              }
+          
+              for name in edits_per_file:
+                  if not (repo / name).is_file():
+                      fail("{} does not exist".format(repo / name))
+          
+              for name, edits in edits_per_file.items():
+                  path = repo / name
+                  original = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                  if PATCH_MARKER in original:
+                      text = original
+                      written = False
+                  else:
+                      text = original
+                      for edit in edits:
+                          old, new, what = edit[0], edit[1], edit[2]
+                          count = edit[3] if len(edit) > 3 else 1
+                          text = replace_once(text, old, new, what, count=count)
+                      written = True
+                  check(name, text)
+                  if written:
+                      with open(path, "w", encoding="utf-8", newline="\n") as output:
+                          output.write(text)
+                      print("Wrote {}".format(path))
+                  else:
+                      print("{} is unchanged".format(path))
+          
+              print("Patch M (v16): the character-to-glyph step now substitutes the CJK/Arabic "
+                    "fallback face only for characters the caller's font cannot draw, records the "
+                    "face that produced each id, and the three CGContextShowGlyphs* entry points "
+                    "draw a run with the recorded face - so the ids and the font always agree - "
+                    "while CTFONTGLYPHS/CGFONTGLYPHS/CGGLYPHS name the first 40 calls of each so a "
+                    "device log can settle whether this pipeline is used at all. DRAWFONT names the "
+                    "first 60 calls of each entry that rasterises text or hands glyph ids to the "
+                    "rasteriser, with the face it selected, the codepoints and the glyph ids that "
+                    "face gives them - and the three empty text stubs stay empty.")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PATCH_V16_CJK_GLYPH_PY
 
-      - name: Check that the patches really landed, including the touch mapping and the
-             CJK/Arabic text fallback
+      - name: Check that the patches really landed, including the touch mapping, the
+             CJK/Arabic text fallback and the CJK/Arabic glyph-id pipeline
         run: |
           set -eu
           # Self-check for the CoreFoundation patch (A), the logging patches (B), the
@@ -6611,8 +8142,8 @@ jobs:
           # file-access / texture-upload tracing (E, v6), the filesystem probe / write
           # tracing (F, v7), the path-origin tracing (G, v8), the nil-component stack
           # trace (H, v9), the `__vsprintf_chk` signature fix (I, v10), the guest-
-          # filesystem resource read (K, v12), the shared touch/render geometry (v13) and the
-          # CJK/Arabic text fallback (L, v14).
+          # filesystem resource read (K, v12), the shared touch/render geometry (v13), the
+          # CJK/Arabic text fallback (L, v14) and the CJK/Arabic glyph-id pipeline (M, v16).
           # Run from the root of the checkout. Fails the build if any of them did not land,
           # so a run can never upload a dylib that still logs the old way, still hides the
           # lookup's directory/lproj, is still missing the resource-lookup fix, still
@@ -6628,7 +8159,8 @@ jobs:
           # instead of the emulated one, or still lays out and rasterises a CJK or Arabic
           # string with a Latin-only face on the CoreText paths, or still maps host touches
           # through its own copy of the letterbox rectangle instead of the one shared in
-          # src/window/geometry.rs.
+          # src/window/geometry.rs, or still maps a CJK/Arabic character to `.notdef` and
+          # draws that id with a font that never produced it.
           
           core=src/frameworks/core_foundation/cf_url.rs
           definitions=$(grep -c "fn CFURLCreateDataAndPropertiesFromResource(" "$core" || true)
@@ -8175,6 +9707,339 @@ jobs:
             exit 1
           fi
           echo "v15: the touch/render geometry (v13) and the CJK/Arabic text fallback (v14) are both in place"
+          
+          echo "== patch M (v16): the CJK/Arabic glyph-id pipeline =="
+          # Patch M carries the fallback face across the character-to-glyph boundary: the
+          # id producer substitutes (and records) glyphs the caller's font cannot draw, and
+          # the three glyph-id drawing entry points draw a run with the face that produced
+          # it. Glyph ids are only meaningful in the namespace of the font that made them,
+          # so the two halves have to be checked together: a build with the substitution but
+          # without the recording (or the other way round) would draw the wrong glyphs.
+          ui_font=src/frameworks/uikit/ui_font.rs
+          uikit=src/frameworks/uikit.rs
+          core_text=src/frameworks/core_text.rs
+          cg_font=src/frameworks/core_graphics/cg_font.rs
+          cg_context=src/frameworks/core_graphics/cg_context.rs
+          
+          # The shared pieces: one classification, one key type, one face chooser.
+          check_marker "$ui_font" "pub(crate) enum FallbackScript {" 1
+          check_marker "$ui_font" "pub(crate) fn fallback_for_char(c: u32) -> Option<FallbackScript> {" 1
+          check_marker "$ui_font" "pub(crate) enum GlyphKey {" 1
+          check_marker "$ui_font" "pub(crate) struct GlyphFace {" 1
+          check_marker "$ui_font" "pub(crate) struct UIFontGlyphSpace {" 1
+          check_marker "$ui_font" "pub(crate) fn glyph_space_for_uifont(" 1
+          check_marker "$ui_font" "pub(crate) fn glyph_log_due(counter: &std::sync::atomic::AtomicUsize) -> bool {" 1
+          check_marker "$ui_font" "pub(crate) fn font_kind_is_bold(kind: FontKind) -> bool {" 1
+          check_marker "$ui_font" "    glyph_faces: HashMap<(GlyphKey, u16), GlyphFace>," 1
+          # The registry, and the rule that only a fully recorded run is redirected.
+          check_marker "$ui_font" "pub(crate) fn fallback_face(&mut self, script: FallbackScript, bold: bool) -> &Font {" 1
+          check_marker "$ui_font" "pub(crate) fn note_glyph_face(&mut self, key: GlyphKey, glyph_id: u16, face: GlyphFace) {" 1
+          check_marker "$ui_font" "pub(crate) fn fallback_glyph_id(" 1
+          check_marker "$ui_font" "pub(crate) fn glyph_run_face(&self, key: GlyphKey, glyph_ids: &[u16]) -> Option<GlyphFace> {" 1
+          # Patch L's contract must survive the refactor: one text-aware lookup, one
+          # classification, and the five text-free metric getters still on the kind lookup.
+          check_marker "$ui_font" "pub(crate) fn get_font<'a>(state: &'a mut State" 1
+          check_marker "$ui_font" "if is_cjk_char(c) {" 1
+          check_marker "$ui_font" "} else if is_arabic_char(c) {" 1
+          check_marker "$ui_font" "get_font_by_kind(" 7
+          check_marker "$ui_font" "\nfn font_kind_is_bold(kind: FontKind) -> bool {" 0
+          
+          # The state accessors, next to patch L's font_for_text.
+          check_marker "$uikit" "pub(crate) fn fallback_glyph_id(" 1
+          check_marker "$uikit" "pub(crate) fn glyph_run_face(" 1
+          check_marker "$uikit" "pub(crate) fn face_for(&mut self, face: ui_font::GlyphFace) -> &crate::font::Font {" 1
+          check_marker "$uikit" "ui_font::get_font(&mut self.ui_font, kind, text)" 1
+          
+          # The CoreText id producer: the substitution, the recording and the trace.
+          check_marker "$core_text" "let space = crate::frameworks::uikit::ui_font::glyph_space_for_uifont(env, ui_font);" 1
+          check_marker "$core_text" "fallback_glyph_id(" 1
+          check_marker "$core_text" '"CTFONTGLYPHS ctfont=0x{:08x} key={:?} chars={} cjk={} arabic={} base_notdef={} substituted={} notdef_out={} all_mapped={}",' 1
+          check_marker "$core_text" "static CTFONTGLYPHS_CALLS: std::sync::atomic::AtomicUsize =" 1
+          check_marker "$core_text" "crate::frameworks::uikit::ui_font::glyph_log_due(&CTFONTGLYPHS_CALLS)" 1
+          # Patch L's invariants in this file: four text-aware call sites, the glyph mapper
+          # still on its own font object, and no second copy of the classification.
+          check_marker "$core_text" "env.framework_state.uikit.font_for_text(font_kind, &text_str);" 4
+          check_marker "$core_text" "let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);" 1
+          check_marker "$core_text" "is_cjk_char(" 0
+          
+          # The CGFont id producer, and the key that says which namespace its ids live in.
+          check_marker "$cg_font" "pub(crate) glyph_key: Option<crate::frameworks::uikit::ui_font::GlyphKey>," 1
+          check_marker "$cg_font" "let host_obj = Box::new(CGFontHostObject { font, glyph_key: None });" 1
+          check_marker "$cg_font" "let key = crate::frameworks::uikit::ui_font::GlyphKey::Object(font.to_bits() as usize);" 1
+          check_marker "$cg_font" "fallback_glyph_id(key, script, false, c)" 1
+          check_marker "$cg_font" '"CGFONTGLYPHS font=0x{:08x} key={:?} chars={} cjk={} arabic={} base_notdef={} substituted={} notdef_out={} all_mapped={}",' 1
+          check_marker "$cg_font" "static CGFONTGLYPHS_CALLS: std::sync::atomic::AtomicUsize =" 1
+          check_marker "$cg_font" "is_cjk_char(" 0
+          
+          # The drawing side: the key on the wrapped font, the registry lookup in all three
+          # entry points, and the face that actually draws.
+          check_marker "$cg_context" "fn note_glyph_run(" 1
+          check_marker "$cg_context" "let glyph_key = uikit::ui_font::glyph_space_for_uifont(env, font).key;" 1
+          check_marker "$cg_context" "let glyph_key = uikit::ui_font::GlyphKey::Kind(uikit::ui_font::FontKind::SansRegular);" 1
+          check_marker "$cg_context" "glyph_key: Some(glyph_key)," 2
+          check_marker "$cg_context" "let glyph_ids_u16: Vec<u16> = glyph_ids.iter().map(|id| id.0).collect();" 3
+          check_marker "$cg_context" ".glyph_run_face(glyph_key, &glyph_ids_u16);" 3
+          check_marker "$cg_context" "Some(face) => env.framework_state.uikit.face_for(face)," 3
+          check_marker "$cg_context" "None => &env.objc.borrow::<CGFontHostObject>(font).font," 3
+          check_marker "$cg_context" 'note_glyph_run(env, context, "CGContextShowGlyphsAtPoint", font, &glyph_ids, run_face);' 1
+          check_marker "$cg_context" 'note_glyph_run(env, context, "CGContextShowGlyphsAtPositions", font, &glyph_ids, run_face);' 1
+          check_marker "$cg_context" 'note_glyph_run(env, context, "CGContextShowGlyphsWithAdvances", font, &glyph_ids, run_face);' 1
+          check_marker "$cg_context" '"CGGLYPHS {} font=0x{:08x} key={:?} size={} n={} notdef={} ids={:?} draw_with={:?}",' 1
+          check_marker "$cg_context" "if !uikit::ui_font::glyph_log_due(&CGGLYPHS_CALLS) {" 1
+          # Patch L's diagnostics and drawing calls must survive verbatim.
+          check_marker "$cg_context" 'note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPoint");' 1
+          check_marker "$cg_context" 'note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsAtPositions");' 1
+          check_marker "$cg_context" 'note_notdef_glyphs(&glyph_ids, "CGContextShowGlyphsWithAdvances");' 1
+          check_marker "$cg_context" "rusttype_font.draw_glyphs(" 1
+          check_marker "$cg_context" "rusttype_font.draw_glyphs_at_positions(" 1
+          check_marker "$cg_context" "rusttype_font.draw_glyphs_with_advances(" 1
+          check_marker "$cg_context" "fn CGContextShowTextAtPoint(" 1
+          check_marker "$cg_context" "fn CGContextShowText(" 1
+          check_marker "$cg_context" "fn CGContextSelectFont(" 1
+          check_marker "$cg_context" "uikit::ui_font::font_from_uifont(env, font)" 1
+          # The pre-patch forms of the constructors and of the draw-font lookup are gone.
+          check_marker "$cg_context" "let host_obj = Box::new(CGFontHostObject { font: f });" 0
+          check_marker "$cg_context" "let host_obj = Box::new(CGFontHostObject { font: crate::font::Font::sans_regular() });" 0
+          check_marker "$cg_context" "    let rusttype_font = &env.objc.borrow::<CGFontHostObject>(font).font;" 0
+          
+          python3 - <<'CHECK_CJK_GLYPH'
+          import pathlib
+          import sys
+          
+          # The checks a substring count cannot make: that the two halves really agree
+          # (only a fully recorded run is redirected, and only a character the caller's
+          # font could not draw is substituted), that the classification has one definition,
+          # and that patch L's contracts in these files are intact.
+          problems = []
+          
+          ui_font = pathlib.Path("src/frameworks/uikit/ui_font.rs").read_text(encoding="utf-8")
+          uikit = pathlib.Path("src/frameworks/uikit.rs").read_text(encoding="utf-8")
+          core_text = pathlib.Path("src/frameworks/core_text.rs").read_text(encoding="utf-8")
+          cg_font = pathlib.Path("src/frameworks/core_graphics/cg_font.rs").read_text(encoding="utf-8")
+          cg_context = pathlib.Path("src/frameworks/core_graphics/cg_context.rs").read_text(encoding="utf-8")
+          
+          for name, text in (("src/frameworks/uikit/ui_font.rs", ui_font),
+                             ("src/frameworks/uikit.rs", uikit),
+                             ("src/frameworks/core_text.rs", core_text),
+                             ("src/frameworks/core_graphics/cg_font.rs", cg_font),
+                             ("src/frameworks/core_graphics/cg_context.rs", cg_context)):
+              if text.count("{") != text.count("}"):
+                  problems.append("{}: braces are unbalanced ({} vs {})".format(
+                      name, text.count("{"), text.count("}")))
+          
+          
+          def body_of(text, header, target):
+              """The body of the function whose signature line is `header`."""
+              if text.count(header) != 1:
+                  problems.append("{}: {!r} appears {} time(s), expected 1".format(
+                      target, header, text.count(header)))
+                  return ""
+              brace = text.find("{\n", text.index(header))
+              if brace == -1:
+                  problems.append("{}: could not find the opening brace of {}".format(target, header))
+                  return ""
+              end = text.find("\n}\n", brace)
+              if end == -1:
+                  problems.append("{}: could not find the end of {}".format(target, header))
+                  return ""
+              return text[brace + 1:end]
+          
+          
+          # 1. One classification, in one file. The glyph pipeline reaches it through
+          #    fallback_for_char; nobody gets a second copy of the ranges.
+          if ui_font.count("fn is_cjk_char(c: u32) -> bool {") != 1:
+              problems.append("src/frameworks/uikit/ui_font.rs: the classification is not defined exactly once")
+          if ui_font.count("fn is_arabic_char(c: u32) -> bool {") != 1:
+              problems.append("src/frameworks/uikit/ui_font.rs: the Arabic ranges are not defined exactly once")
+          for text, name in ((core_text, "src/frameworks/core_text.rs"),
+                             (cg_font, "src/frameworks/core_graphics/cg_font.rs"),
+                             (cg_context, "src/frameworks/core_graphics/cg_context.rs")):
+              if "fn is_cjk_char(" in text or "is_cjk_char(" in text or "is_arabic_char(" in text:
+                  problems.append("{}: carries or reaches into the classification instead of using"
+                                  " fallback_for_char".format(name))
+          
+          fallback_for_char = body_of(ui_font, "pub(crate) fn fallback_for_char(c: u32) -> Option<FallbackScript> {",
+                                      "src/frameworks/uikit/ui_font.rs")
+          if fallback_for_char:
+              for needed in ("let cjk = is_cjk_char(c);", "let arabic = is_arabic_char(c);",
+                             "Some(FallbackScript::Cjk)", "Some(FallbackScript::Arabic)"):
+                  if needed not in fallback_for_char:
+                      problems.append("src/frameworks/uikit/ui_font.rs: fallback_for_char lost {!r}".format(needed))
+          
+          # 2. Rule 1: only a character the caller's own font could not draw (id 0) is
+          #    substituted, in both producers.
+          for text, name, header, extra in (
+                  (core_text, "src/frameworks/core_text.rs", "fn CTFontGetGlyphsForCharacters(",
+                   "env.framework_state.uikit.fallback_glyph_id("),
+                  (cg_font, "src/frameworks/core_graphics/cg_font.rs", "fn CGFontGetGlyphsForUnichars(",
+                   "fallback_glyph_id(key, script, false, c)")):
+              body = body_of(text, header, name)
+              if not body:
+                  continue
+              for needed in ("let mut g", "if g == 0 {", "base_notdef += 1;",
+                             "let script = crate::frameworks::uikit::ui_font::fallback_for_char(",
+                             extra, "substituted += 1;", "env.mem.write(glyphs + i, g);"):
+                  if needed not in body:
+                      problems.append("{}: {} is missing {!r}".format(name, header, needed))
+              if body.index("if g == 0 {") > body.index(extra):
+                  problems.append("{}: {} substitutes before checking that the font lacks the"
+                                  " glyph".format(name, header))
+              # the guest glyph array is written for every character, substituted or not
+              if body.count("env.mem.write(glyphs + i, g);") != 1:
+                  problems.append("{}: {} does not write exactly one id per character".format(name, header))
+              # the returned flag keeps the caller-font meaning
+              if body.count("all_mapped = false;") != 1:
+                  problems.append("{}: {} reports all_mapped oddly".format(name, header))
+          
+          # 3. Rule 2: a run is redirected only when every id in it is recorded, and only
+          #    when they agree.
+          run_face = body_of(ui_font, "pub(crate) fn glyph_run_face(&self, key: GlyphKey, glyph_ids: &[u16]) -> Option<GlyphFace> {",
+                             "src/frameworks/uikit/ui_font.rs")
+          if run_face:
+              for needed in ("let candidate = self.glyph_faces.get(&(key, *glyph_id)).copied()?;",
+                             "Some(previous) if previous == candidate => {}",
+                             "Some(_) => return None,"):
+                  if needed not in run_face:
+                      problems.append("src/frameworks/uikit/ui_font.rs: glyph_run_face lost {!r}".format(needed))
+          
+          # 4. Rule 3: a conflict makes an id ambiguous instead of picking a winner.
+          note_face = body_of(ui_font, "pub(crate) fn note_glyph_face(&mut self, key: GlyphKey, glyph_id: u16, face: GlyphFace) {",
+                              "src/frameworks/uikit/ui_font.rs")
+          if note_face:
+              if "Some(existing) if *existing != face => {" not in note_face \
+                      or "self.glyph_faces.remove(&(key, glyph_id));" not in note_face:
+                  problems.append("src/frameworks/uikit/ui_font.rs: a conflicting glyph face is not dropped")
+          
+          # 5. The substitution keeps the caller's own face when the fallback cannot draw
+          #    the character either (never invent a glyph).
+          sub = body_of(ui_font, "pub(crate) fn fallback_glyph_id(", "src/frameworks/uikit/ui_font.rs")
+          if sub:
+              if "if id == 0 {" not in sub or "return None;" not in sub:
+                  problems.append("src/frameworks/uikit/ui_font.rs: an unmappable fallback glyph is not"
+                                  " reported as such")
+          
+          # 6. The three drawing entry points: registry lookup, the trace, and the face that
+          #    draws; the ids themselves are never rewritten.
+          for header, entry, draw in (
+                  ("fn CGContextShowGlyphsAtPoint(", "CGContextShowGlyphsAtPoint", "rusttype_font.draw_glyphs("),
+                  ("fn CGContextShowGlyphsAtPositions(", "CGContextShowGlyphsAtPositions",
+                   "rusttype_font.draw_glyphs_at_positions("),
+                  ("fn CGContextShowGlyphsWithAdvances(", "CGContextShowGlyphsWithAdvances",
+                   "rusttype_font.draw_glyphs_with_advances(")):
+              body = body_of(cg_context, header, "src/frameworks/core_graphics/cg_context.rs")
+              if not body:
+                  continue
+              for needed in ("glyph_run_face(glyph_key, &glyph_ids_u16)",
+                             "note_glyph_run(env, context, \"{}\", font, &glyph_ids, run_face);".format(entry),
+                             "Some(face) => env.framework_state.uikit.face_for(face),",
+                             "None => &env.objc.borrow::<CGFontHostObject>(font).font,",
+                             draw):
+                  if needed not in body:
+                      problems.append("src/frameworks/core_graphics/cg_context.rs: {} is missing {!r}".format(
+                          header, needed))
+              if body.index("let run_face = env") > body.index(draw):
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: {} draws before resolving the"
+                                  " run's face".format(header))
+              # patch L's per-run .notdef report is still there
+              if 'note_notdef_glyphs(&glyph_ids, "{}");'.format(entry) not in body:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: {} lost patch L's .notdef"
+                                  " report".format(header))
+          
+          # 7. CGContextSetFont records the face it wraps (by kind, not by address) and
+          #    keeps patch L's conversion.
+          set_font = body_of(cg_context, "fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {",
+                             "src/frameworks/core_graphics/cg_context.rs")
+          if set_font:
+              for needed in ("uikit::ui_font::font_from_uifont(env, font)",
+                             "let glyph_key = uikit::ui_font::glyph_space_for_uifont(env, font).key;",
+                             "glyph_key: Some(glyph_key),",
+                             "uikit::ui_font::GlyphKey::Kind(uikit::ui_font::FontKind::SansRegular);"):
+                  if needed not in set_font:
+                      problems.append("src/frameworks/core_graphics/cg_context.rs: CGContextSetFont is missing"
+                                      " {!r}".format(needed))
+              if "font_for_text" in set_font or "font_kind_from_uifont" in set_font:
+                  problems.append("src/frameworks/core_graphics/cg_context.rs: CGContextSetFont tries to choose"
+                                  " a fallback font, but the text is not known when a font is selected")
+          
+          # 8. The trace policy: first 40 calls, then every 200th, normal-level logs only.
+          due = body_of(ui_font, "pub(crate) fn glyph_log_due(counter: &std::sync::atomic::AtomicUsize) -> bool {",
+                        "src/frameworks/uikit/ui_font.rs")
+          if due:
+              if "call <= 40 || call % 200 == 0" not in due:
+                  problems.append("src/frameworks/uikit/ui_font.rs: the glyph trace policy is not"
+                                  " 40-then-every-200")
+          for text, name, marker in ((core_text, "src/frameworks/core_text.rs", "CTFONTGLYPHS"),
+                                     (cg_font, "src/frameworks/core_graphics/cg_font.rs", "CGFONTGLYPHS"),
+                                     (cg_context, "src/frameworks/core_graphics/cg_context.rs", "CGGLYPHS")):
+              if 'log!(\n' not in text and marker in text:
+                  problems.append("{}: the {} trace does not use log!".format(name, marker))
+              if marker in text and "log_dbg" in text.split(marker)[0][-400:]:
+                  problems.append("{}: the {} trace is next to a log_dbg! call".format(name, marker))
+          
+          # 9. Patch L's and patch M's text diagnostics coexist: CJKFONT for the text paths,
+          #    CTFONTGLYPHS/CGFONTGLYPHS/CGGLYPHS for the glyph pipeline.
+          if '"CJKFONT requested={:?} -> NotoSansSC ({} CJK chars)",' not in ui_font:
+              problems.append("src/frameworks/uikit/ui_font.rs: patch L's CJKFONT trace is gone")
+          
+          if problems:
+              for problem in problems:
+                  print("::error::" + problem)
+              sys.exit(1)
+          print("patch M: the CJK/Arabic substitution records the face that produced each glyph id"
+                " (one classification, one key type), the three CGContextShowGlyphs* entry points draw a"
+                " run only when every id in it came from that one face, CGContextSetFont records the face"
+                " it wraps by FontKind, and CTFONTGLYPHS/CGFONTGLYPHS/CGGLYPHS name the first 40 calls of"
+                " each - so a device log can tell whether this pipeline is used at all")
+          CHECK_CJK_GLYPH
+          
+          # No v16 assertion replaces the v15 one above: patch M does not implement the three
+          # text entry points, so v15's "they must stay empty stubs" still holds and is kept
+          # verbatim. It is restated here in a form that can actually fail (v15's own form
+          # does `if not body: continue`, which the empty body always satisfies), and the
+          # markers the rejected line introduced are pinned at zero.
+          python3 - <<'CHECK_TEXT_STUBS'
+          import pathlib
+          import sys
+          
+          path = "src/frameworks/core_graphics/cg_context.rs"
+          text = pathlib.Path(path).read_text(encoding="utf-8")
+          STUBS = {
+              "fn CGContextShowTextAtPoint(": ("_x: CGFloat,", "_y: CGFloat,",
+                                               "_string: crate::mem::ConstPtr<u8>,", "_length: u32,"),
+              "fn CGContextShowText(": ("_string: crate::mem::ConstPtr<u8>,", "_length: u32,"),
+              "fn CGContextSelectFont(": ("_name: crate::mem::ConstPtr<u8>,", "_size: CGFloat,",
+                                         "_encoding: i32,"),
+          }
+          problems = []
+          for header, ignored_params in STUBS.items():
+              if text.count(header) != 1:
+                  problems.append("{}: {!r} appears {} time(s), expected 1".format(
+                      path, header, text.count(header)))
+                  continue
+              start = text.index(header)
+              brace = text.index("{\n", start)
+              end = text.index("\n}\n", brace)
+              body = text[brace + 2:end]
+              if body.strip() != "":
+                  problems.append("{}: {} is no longer an empty stub (it gained a body: {!r})".format(
+                      path, header, body.strip()[:60]))
+              signature = text[start:brace]
+              for param in ignored_params:
+                  if param not in signature:
+                      problems.append("{}: {} lost the parameter {!r}".format(path, header, param))
+          
+          for problem in problems:
+              print("::error::" + problem)
+          if problems:
+              sys.exit(1)
+          print("the three text entry points are still empty stubs that ignore their"
+                " arguments, and nothing of the rejected CGTEXTAPI line is back")
+          CHECK_TEXT_STUBS
+          
+          for rejected in "CGTEXTAPI" "cg_show_text" "cg_text_bytes" "select_font_name" \
+                  "select_font_encoding" "fallback_for_char(character as u32)"; do
+            check_marker "$cg_context" "$rejected" 0
+          done
 
       - name: Build the shared SDL2 the core links against
         run: |
@@ -8265,6 +10130,16 @@ jobs:
             echo "::error::the --trace-touch-map option is not in the dylib"
             exit 1
           fi
+
+          echo "== v16: the CJK/Arabic glyph-id pipeline is compiled in =="
+          for marker in "CTFONTGLYPHS ctfont=" "CGFONTGLYPHS font=" "CGGLYPHS {} font="; do
+            found=$(strings "$dylib" | grep -c -F -- "$marker" || true)
+            echo "$marker occurrences: $found"
+            if [ "$found" -lt 1 ]; then
+              echo "::error::the v16 glyph-id trace $marker is not in the dylib"
+              exit 1
+            fi
+          done
           
 
       - name: Collect the dylib and its sha256
@@ -8279,7 +10154,7 @@ jobs:
       - name: Upload the dylib
         uses: actions/upload-artifact@v4
         with:
-          name: hyperhle-core-ios-arm64-v15
+          name: hyperhle-core-ios-arm64-v16
           path: dist/*
           if-no-files-found: error
           retention-days: 30
