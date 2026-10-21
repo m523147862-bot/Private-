@@ -1,0 +1,72 @@
+# Temporary diagnostic workflow: which Darwin linker/toolchain produces the
+# arm64e `__cfstring` authenticated binds (auth-bind key=DA) that
+# MacWSWindowing's artifact contract requires?
+# Delete once build-apple.yml passes its assertions.
+name: Diagnose MacWSWindowing link variants
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  variants:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Theos
+        run: |
+          set -euxo pipefail
+          brew install ldid
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          git clone --quiet --recursive --depth 1 https://github.com/theos/theos "$RUNNER_TEMP/theos"
+
+      - name: Link the tweak with each available toolchain and dump its fixups
+        run: |
+          set -uxo pipefail
+          report() {
+            bin="$1"; tag="$2"
+            cp "$bin" "$RUNNER_TEMP/$tag.dylib"
+            echo "================ $tag"
+            lipo -info "$bin"
+            echo "--- header"
+            dyld_info -fixups "$bin" | head -20
+            echo "--- auth rows (any section)"
+            dyld_info -fixups "$bin" | grep -c 'auth-bind' || true
+            echo "--- __cfstring rows"
+            dyld_info -arch arm64e -fixups "$bin" | awk '$2 == "__cfstring" { print $4, $5 }' | sort | uniq -c
+            echo "--- sample rows"
+            dyld_info -arch arm64e -fixups "$bin" | grep '__cfstring' | head -3
+          }
+
+          echo "##### default Xcode"
+          xcodebuild -version; ld -v; xcrun --sdk iphoneos --show-sdk-version
+          make -C MacWSWindowing clean all FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+            THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 >/dev/null 2>&1
+          report MacWSWindowing/.theos/obj/MacWSWindowing.dylib default
+
+          for xc in /Applications/Xcode_16.2.app /Applications/Xcode_15.0.1.app; do
+            [ -d "$xc" ] || continue
+            sudo xcode-select -s "$xc"
+            echo "##### $xc"
+            xcodebuild -version; ld -v; xcrun --sdk iphoneos --show-sdk-version
+            make -C MacWSWindowing clean all FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+              THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 >/dev/null 2>&1
+            report MacWSWindowing/.theos/obj/MacWSWindowing.dylib "$(basename "$xc")"
+          done
+
+          echo "##### -fixup_chains on default Xcode"
+          sudo xcode-select -s /Applications/Xcode_15.4.app 2>/dev/null || true
+          ld -v
+          make -C MacWSWindowing clean all FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+            THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+            MacWSWindowing_LDFLAGS=-Wl,-fixup_chains >/dev/null 2>&1
+          report MacWSWindowing/.theos/obj/MacWSWindowing.dylib fixup_chains
+
+          echo "##### summaries"
+          for f in "$RUNNER_TEMP"/*.dylib; do
+            echo "-- $f"
+            dyld_info -arch arm64e -fixups "$f" | awk '$2 == "__cfstring" { print $4, $5 }' | sort | uniq -c
+          done
