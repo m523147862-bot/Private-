@@ -5,12 +5,15 @@
 
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/vm_map.h>
 #include <mach/bootstrap.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -77,6 +80,44 @@ static NSUInteger NextSnapshotSlot;
 static pthread_mutex_t SnapshotSlotLock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint32_t SnapshotFailureWitnesses;
 
+// The final composite cannot cross the task boundary as an IOSurface: every
+// IOSurface registry lookup is task-local on this host, by ID and by port alike
+// (patches/a57e-P1-surface-registry-boundary-20261022.md, two entitled native
+// processes, kIOSurfaceIsGlobal tried every way).  The transport is therefore a
+// Mach memory object carrying the frame's bytes:
+//
+//   1. this task mmaps an anonymous buffer per slot and hands its pages out
+//      once through mach_make_memory_entry_64 (a plain VM object, so the
+//      window server needs no IOKit or IOSurface privilege to create it),
+//   2. per published frame the completed snapshot is copied into that buffer
+//      (22.4 MB at 60 Hz is ~1.34 GB/s of memcpy; this SoC's memory bandwidth is
+//      an order of magnitude above that) and the memory object's send right is
+//      forwarded in the message,
+//   3. macwsdisplayd maps it read-only, copies the frame into a surface it owns
+//      and scans that out, so the surface registry never crosses a task.
+//
+// The ring gives the receiver four publication intervals to finish its copy
+// before a slot is rewritten.  There is no reply channel, so the floor below is
+// a burst guard, not a frame clock.
+enum { MacWSFinalCompositeVmSlotCount = 4 };
+typedef struct {
+    uint8_t *base;
+    size_t capacity;
+    mach_port_t memoryEntry;
+    size_t width;
+    size_t height;
+    size_t bytesPerRow;
+    uint32_t pixelFormat;
+    uint64_t lastPublishedNS;
+    unsigned inFlight;
+    bool retirePending;
+} MacWSFinalCompositeVmSlot;
+static MacWSFinalCompositeVmSlot VmSlots[MacWSFinalCompositeVmSlotCount];
+static NSUInteger NextVmSlot;
+static pthread_mutex_t VmSlotLock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint32_t VmFailureWitnesses;
+static const uint64_t VmSlotReuseNanoseconds = 16 * NSEC_PER_MSEC;
+
 static bool DirectCompositeTransportRequested(void) {
     static bool direct;
     static dispatch_once_t onceToken;
@@ -101,6 +142,157 @@ static uint64_t MonotonicNanoseconds(void) {
     struct timespec now = {0};
     return clock_gettime(CLOCK_MONOTONIC, &now) == 0
         ? (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec : 0;
+}
+
+static void VmLogFailure(const char *stage, kern_return_t result,
+                         size_t bytes) {
+    uint32_t witness = atomic_fetch_add_explicit(
+        &VmFailureWitnesses, 1, memory_order_relaxed) + 1;
+    if (witness <= 12) {
+        dprintf(STDERR_FILENO,
+            "#### FINAL-COMPOSITE vm-transport-failed stage=%s witness=%u "
+            "kr=%#x bytes=%zu\n", stage, witness, result, bytes);
+    }
+}
+
+// Caller holds VmSlotLock.
+static void DestroyVmSlot(MacWSFinalCompositeVmSlot *slot) {
+    if (MACH_PORT_VALID(slot->memoryEntry))
+        (void)mach_port_deallocate(mach_task_self(), slot->memoryEntry);
+    if (slot->base) (void)munmap(slot->base, slot->capacity);
+    memset(slot, 0, sizeof(*slot));
+}
+
+// Caller holds VmSlotLock.  The buffer is anonymous memory, so the memory
+// object is a plain VM object whose pages this task keeps mapped writable and
+// the receiver maps read-only; nothing about it belongs to the surface
+// registry.
+static bool CreateVmSlot(MacWSFinalCompositeVmSlot *slot, size_t width,
+                         size_t height, size_t bytesPerRow,
+                         uint32_t pixelFormat) {
+    if (!slot || bytesPerRow == 0 || height == 0 ||
+        bytesPerRow > SIZE_MAX / height) return false;
+    size_t bytes = bytesPerRow * height;
+    size_t pageSize = (size_t)getpagesize();
+    if (pageSize == 0 || bytes > SIZE_MAX - (pageSize - 1)) return false;
+    size_t capacity = (bytes + pageSize - 1) & ~(pageSize - 1);
+    void *base = mmap(NULL, capacity, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) {
+        VmLogFailure("mmap", errno, capacity);
+        return false;
+    }
+    memory_object_size_t entrySize = (memory_object_size_t)capacity;
+    mach_port_t entry = MACH_PORT_NULL;
+    kern_return_t result = mach_make_memory_entry_64(
+        mach_task_self(), &entrySize, (mach_vm_offset_t)base,
+        VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
+    if (result != KERN_SUCCESS || !MACH_PORT_VALID(entry) ||
+        entrySize < (memory_object_size_t)bytes) {
+        if (MACH_PORT_VALID(entry))
+            (void)mach_port_deallocate(mach_task_self(), entry);
+        (void)munmap(base, capacity);
+        VmLogFailure("make-memory-entry", result, capacity);
+        return false;
+    }
+    slot->base = base;
+    slot->capacity = capacity;
+    slot->memoryEntry = entry;
+    slot->width = width;
+    slot->height = height;
+    slot->bytesPerRow = bytesPerRow;
+    slot->pixelFormat = pixelFormat;
+    slot->lastPublishedNS = 0;
+    slot->inFlight = 0;
+    slot->retirePending = false;
+    dprintf(STDERR_FILENO,
+        "#### FINAL-COMPOSITE vm-slot-ready geometry=%zux%zu bpr=%zu "
+        "bytes=%zu capacity=%zu entry=%u\n",
+        width, height, bytesPerRow, bytes, capacity, entry);
+    return true;
+}
+
+// Returns a slot reserved for this frame (inFlight counted), or NULL when no
+// slot is outside its reuse window.  The caller must pass it to ReleaseVmSlot
+// once the message carrying the memory object has been sent.
+static MacWSFinalCompositeVmSlot *AcquireVmSlot(size_t width, size_t height,
+                                                size_t bytesPerRow,
+                                                uint32_t pixelFormat) {
+    uint64_t nowNS = MonotonicNanoseconds();
+    pthread_mutex_lock(&VmSlotLock);
+    for (NSUInteger attempt = 0;
+         attempt < MacWSFinalCompositeVmSlotCount; attempt++) {
+        NSUInteger index = (NextVmSlot + attempt) %
+            MacWSFinalCompositeVmSlotCount;
+        MacWSFinalCompositeVmSlot *slot = &VmSlots[index];
+        bool compatible = slot->base && slot->width == width &&
+            slot->height == height && slot->bytesPerRow == bytesPerRow &&
+            slot->pixelFormat == pixelFormat;
+        if (slot->base && !compatible) {
+            // Geometry changed (window resize, display mode change).  Retire
+            // only once no publisher is mid-copy and the reuse floor passed.
+            slot->retirePending = true;
+            if (slot->inFlight == 0 &&
+                (!nowNS || !slot->lastPublishedNS ||
+                 nowNS - slot->lastPublishedNS >= VmSlotReuseNanoseconds))
+                DestroyVmSlot(slot);
+            continue;
+        }
+        if (slot->base && (slot->inFlight != 0 ||
+                (nowNS && slot->lastPublishedNS &&
+                 nowNS - slot->lastPublishedNS <
+                     VmSlotReuseNanoseconds)))
+            continue;
+        if (!slot->base &&
+            !CreateVmSlot(slot, width, height, bytesPerRow, pixelFormat))
+            continue;
+        slot->inFlight++;
+        slot->lastPublishedNS = nowNS;
+        NextVmSlot = (index + 1) % MacWSFinalCompositeVmSlotCount;
+        pthread_mutex_unlock(&VmSlotLock);
+        return slot;
+    }
+    pthread_mutex_unlock(&VmSlotLock);
+    return NULL;
+}
+
+static void ReleaseVmSlot(MacWSFinalCompositeVmSlot *slot) {
+    if (!slot) return;
+    pthread_mutex_lock(&VmSlotLock);
+    if (slot->inFlight > 0) slot->inFlight--;
+    if (slot->retirePending && slot->inFlight == 0) DestroyVmSlot(slot);
+    pthread_mutex_unlock(&VmSlotLock);
+}
+
+// The memory object aliases this mapping, so the copy is the whole handoff:
+// the receiver faults the same pages this task just wrote.  IOSurfaceLock is
+// the documented barrier for reading a GPU-written surface through its base
+// address; both call sites run after the snapshot blit (or its completion
+// callback) has finished.
+static bool CopyFrameIntoVmSlot(IOSurfaceRef surface,
+                                MacWSFinalCompositeVmSlot *slot, size_t height,
+                                size_t bytesPerRow) {
+    if (!surface || !slot || !slot->base) return false;
+    if (bytesPerRow == 0 || height == 0 ||
+        bytesPerRow > SIZE_MAX / height) return false;
+    size_t bytes = bytesPerRow * height;
+    if (bytes > slot->capacity) {
+        VmLogFailure("slot-capacity", KERN_INVALID_ARGUMENT, bytes);
+        return false;
+    }
+    kern_return_t lockResult = IOSurfaceLock(surface, kIOSurfaceLockReadOnly,
+                                            NULL);
+    if (lockResult != KERN_SUCCESS) {
+        VmLogFailure("surface-lock", lockResult, bytes);
+        return false;
+    }
+    const uint8_t *source = (const uint8_t *)IOSurfaceGetBaseAddress(surface);
+    bool copied = source != NULL;
+    if (copied)
+        memcpy(slot->base, source, bytes);
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    if (!copied) VmLogFailure("surface-base", KERN_INVALID_ADDRESS, bytes);
+    return copied;
 }
 
 static uint64_t MachDurationNanoseconds(uint64_t ticks) {
@@ -210,6 +402,7 @@ bool MacWSFinalCompositePublisherPublishSurface(
     uint32_t ioSurfacePixelFormat = IOSurfaceGetPixelFormat(surface);
     if (ioSurfacePixelFormat == 0)
         ioSurfacePixelFormat = MACWS_FINAL_COMPOSITE_BGRA;
+    if (height == 0 || bytesPerRow > SIZE_MAX / height) return false;
     MacWSFinalCompositeRecord record = {
         .magic = MACWS_FINAL_COMPOSITE_MAGIC,
         .version = MACWS_FINAL_COMPOSITE_VERSION,
@@ -225,6 +418,9 @@ bool MacWSFinalCompositePublisherPublishSurface(
             ? (uint32_t)bytesPerRow : 0,
         .ioSurfacePixelFormat = ioSurfacePixelFormat,
         .metalPixelFormat = metalPixelFormat,
+        .transport = MACWS_FINAL_COMPOSITE_TRANSPORT_VM,
+        .vmOffset = 0,
+        .vmSize = (uint64_t)bytesPerRow * height,
     };
     if (!MacWSFinalCompositeRecordIsValid(&record, sizeof(record)))
         return false;
@@ -242,17 +438,32 @@ bool MacWSFinalCompositePublisherPublishSurface(
         }
         return false;
     }
-    mach_port_t surfacePort = IOSurfaceCreateMachPort(surface);
-    if (!MACH_PORT_VALID(surfacePort)) {
+    MacWSFinalCompositeVmSlot *slot = AcquireVmSlot(
+        width, height, bytesPerRow, ioSurfacePixelFormat);
+    if (!slot) {
         uint32_t witness = atomic_fetch_add_explicit(
             &FailureWitnesses, 1, memory_order_relaxed) + 1;
         if (witness <= 8) {
             dprintf(STDERR_FILENO,
-                "#### FINAL-COMPOSITE publish-failed stage=surface-port "
-                "witness=%u sequence=%llu surface=%u service=%u\n",
+                "#### FINAL-COMPOSITE publish-failed stage=vm-slot "
+                "witness=%u sequence=%llu surface=%u bytes=%llu\n",
                 witness, (unsigned long long)record.sequence,
-                record.surfaceID, service);
+                record.surfaceID, (unsigned long long)record.vmSize);
         }
+        (void)mach_port_deallocate(mach_task_self(), service);
+        return false;
+    }
+    if (!CopyFrameIntoVmSlot(surface, slot, height, bytesPerRow)) {
+        uint32_t witness = atomic_fetch_add_explicit(
+            &FailureWitnesses, 1, memory_order_relaxed) + 1;
+        if (witness <= 8) {
+            dprintf(STDERR_FILENO,
+                "#### FINAL-COMPOSITE publish-failed stage=vm-copy "
+                "witness=%u sequence=%llu surface=%u bytes=%llu\n",
+                witness, (unsigned long long)record.sequence,
+                record.surfaceID, (unsigned long long)record.vmSize);
+        }
+        ReleaseVmSlot(slot);
         (void)mach_port_deallocate(mach_task_self(), service);
         return false;
     }
@@ -265,9 +476,9 @@ bool MacWSFinalCompositePublisherPublishSurface(
     message.header.msgh_local_port = MACH_PORT_NULL;
     message.header.msgh_id = MACWS_FINAL_COMPOSITE_MACH_MESSAGE_ID;
     message.body.msgh_descriptor_count = 1;
-    message.surfacePort.name = surfacePort;
-    message.surfacePort.disposition = MACH_MSG_TYPE_COPY_SEND;
-    message.surfacePort.type = MACH_MSG_PORT_DESCRIPTOR;
+    message.memoryObjectPort.name = slot->memoryEntry;
+    message.memoryObjectPort.disposition = MACH_MSG_TYPE_COPY_SEND;
+    message.memoryObjectPort.type = MACH_MSG_PORT_DESCRIPTOR;
     message.record = record;
     mach_msg_return_t result = SendMessage(&message, service);
     if (result == MACH_SEND_INVALID_DEST) {
@@ -276,7 +487,7 @@ bool MacWSFinalCompositePublisherPublishSurface(
         service = AcquireService();
         if (MACH_PORT_VALID(service)) result = SendMessage(&message, service);
     }
-    (void)mach_port_deallocate(mach_task_self(), surfacePort);
+    ReleaseVmSlot(slot);
     if (result == MACH_SEND_INVALID_DEST) InvalidateService(service);
     if (MACH_PORT_VALID(service))
         (void)mach_port_deallocate(mach_task_self(), service);
@@ -402,14 +613,12 @@ static MacWSFinalCompositeSnapshotSlot *AcquireSnapshotSlot(
             (__bridge id)kIOSurfaceAllocSize: @(bytesPerRow * height),
             (__bridge id)kIOSurfacePixelFormat:
                 @(MACWS_FINAL_COMPOSITE_BGRA),
-            // Cross-task handoff.  displayd runs outside the chroot and cannot
-            // resolve an IOSurface mach port created in this task
-            // (macwsallocd/main.m:205-210, runtime-confirmed 2026-06-19), so it
-            // receives this frame by ID instead.  kIOSurfaceIsGlobal is the
-            // documented precondition for IOSurfaceLookup() across tasks;
-            // spelled as the raw property key because the IOSurface header
-            // marks that macro deprecated.
-            @"IOSurfaceIsGlobal": @YES,
+            // This surface never leaves the task: it is the GPU blit target the
+            // CPU copies out of in PublishSurface.  kIOSurfaceIsGlobal was
+            // tried here first and is gone because the P1 probe measured it as
+            // no help at all (patches/a57e-P1-surface-registry-boundary-
+            // 20261022.md: cross-task port and ID lookups both NULL for global
+            // and non-global surfaces alike).
         };
         IOSurfaceRef surface = IOSurfaceCreate(
             (__bridge CFDictionaryRef)properties);

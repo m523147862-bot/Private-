@@ -6,7 +6,10 @@
 #include <mach/bootstrap.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_statistics.h>
 #include <stdatomic.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -57,6 +60,148 @@ static uint32_t NextRejectWitness(void) {
                                      memory_order_relaxed) + 1;
 }
 
+// A frame arrives as a Mach memory object, so this process has to produce its
+// own surface to present: an IOSurface created in WindowServer's task is
+// unreachable from this one by port and by ID alike
+// (patches/a57e-P1-surface-registry-boundary-20261022.md).  Surfaces created
+// here are the proven path -- every other stream in this daemon already hands
+// one to Host over XPC.  Four slots keep one frame's GPU readers from colliding
+// with the next frame's CPU write; a slot is rewritten only when
+// IOSurfaceIsInUse reports nobody holds it, which covers this process's own
+// current-frame count (DeliverFinalComposite's increment) and Host leases.
+enum { MacWSFinalCompositeConsumerSurfaceCount = 4 };
+typedef struct {
+    IOSurfaceRef surface;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bytesPerRow;
+    uint32_t pixelFormat;
+    uint64_t lastDeliveredNS;
+} MacWSFinalCompositeConsumerSurface;
+// Touched only from ReceiveAvailableMessages, which the receiver dispatches on
+// the serial display queue.
+static MacWSFinalCompositeConsumerSurface ConsumerSurfaces[
+    MacWSFinalCompositeConsumerSurfaceCount];
+static NSUInteger NextConsumerSurface;
+static _Atomic uint32_t AcceptedFrames;
+static const uint64_t ConsumerSurfaceReuseNanoseconds = 16 * NSEC_PER_MSEC;
+
+static uint64_t ReceiverMonotonicNanoseconds(void) {
+    struct timespec now = {0};
+    return clock_gettime(CLOCK_MONOTONIC, &now) == 0
+        ? (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec : 0;
+}
+
+static IOSurfaceRef CreateConsumerSurface(uint32_t width, uint32_t height,
+                                          uint32_t bytesPerRow,
+                                          uint32_t pixelFormat) {
+    NSDictionary *properties = @{
+        (__bridge id)kIOSurfaceWidth: @(width),
+        (__bridge id)kIOSurfaceHeight: @(height),
+        (__bridge id)kIOSurfaceBytesPerElement: @4,
+        (__bridge id)kIOSurfaceBytesPerRow: @(bytesPerRow),
+        (__bridge id)kIOSurfaceAllocSize: @((uint64_t)bytesPerRow * height),
+        (__bridge id)kIOSurfacePixelFormat: @(pixelFormat),
+    };
+    IOSurfaceRef surface = IOSurfaceCreate(
+        (__bridge CFDictionaryRef)properties);
+    if (!surface) {
+        ReceiverLog(@"final-composite-consumer-surface-failed geometry=%ux%u "
+                    "bpr=%u pf=%08x",
+                    width, height, bytesPerRow, pixelFormat);
+        return NULL;
+    }
+    // IOSurfaceCreate may round a geometry up.  A surface whose rows do not
+    // match the producer's bytesPerRow cannot receive this payload verbatim, so
+    // reject it here instead of corrupting the frame.
+    if (IOSurfaceGetWidth(surface) != width ||
+        IOSurfaceGetHeight(surface) != height ||
+        IOSurfaceGetBytesPerRow(surface) != bytesPerRow ||
+        (IOSurfaceGetPixelFormat(surface) != 0 &&
+         IOSurfaceGetPixelFormat(surface) != pixelFormat)) {
+        ReceiverLog(@"final-composite-consumer-surface-mismatch "
+                    "expected=(%ux%u bpr=%u pf=%08x) "
+                    "actual=(%zux%zu bpr=%zu pf=%08x)",
+                    width, height, bytesPerRow, pixelFormat,
+                    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+                    IOSurfaceGetBytesPerRow(surface),
+                    IOSurfaceGetPixelFormat(surface));
+        CFRelease(surface);
+        return NULL;
+    }
+    return surface;
+}
+
+// Returns the slot's surface without an extra retain: the accepted handler owns
+// its own reference (DeliverFinalComposite CFRetains), and a slot's own
+// reference outlives every handoff because a slot is only released on a
+// geometry change, when no reader holds it.
+static IOSurfaceRef AcquireConsumerSurface(
+        const MacWSFinalCompositeRecord *record) {
+    uint64_t nowNS = ReceiverMonotonicNanoseconds();
+    for (NSUInteger attempt = 0;
+         attempt < MacWSFinalCompositeConsumerSurfaceCount; attempt++) {
+        NSUInteger index = (NextConsumerSurface + attempt) %
+            MacWSFinalCompositeConsumerSurfaceCount;
+        MacWSFinalCompositeConsumerSurface *slot = &ConsumerSurfaces[index];
+        if (slot->surface &&
+            (slot->width != record->width ||
+             slot->height != record->height ||
+             slot->bytesPerRow != record->bytesPerRow ||
+             slot->pixelFormat != record->ioSurfacePixelFormat)) {
+            if (IOSurfaceIsInUse(slot->surface)) continue;
+            CFRelease(slot->surface);
+            memset(slot, 0, sizeof(*slot));
+        }
+        if (!slot->surface) {
+            IOSurfaceRef created = CreateConsumerSurface(
+                record->width, record->height, record->bytesPerRow,
+                record->ioSurfacePixelFormat);
+            if (!created) continue;
+            slot->surface = created;
+            slot->width = record->width;
+            slot->height = record->height;
+            slot->bytesPerRow = record->bytesPerRow;
+            slot->pixelFormat = record->ioSurfacePixelFormat;
+            slot->lastDeliveredNS = 0;
+        }
+        if (IOSurfaceIsInUse(slot->surface)) continue;
+        if (nowNS && slot->lastDeliveredNS &&
+            nowNS - slot->lastDeliveredNS < ConsumerSurfaceReuseNanoseconds)
+            continue;
+        slot->lastDeliveredNS = nowNS;
+        NextConsumerSurface = (index + 1) %
+            MacWSFinalCompositeConsumerSurfaceCount;
+        return slot->surface;
+    }
+    return NULL;
+}
+
+static bool CopyPayloadIntoSurface(const MacWSFinalCompositeRecord *record,
+                                   const void *payload, IOSurfaceRef surface) {
+    kern_return_t lockResult = IOSurfaceLock(surface, 0, NULL);
+    if (lockResult != KERN_SUCCESS) {
+        ReceiverLog(@"final-composite-rejected stage=consumer-surface-lock "
+                    "sequence=%llu kr=%#x",
+                    (unsigned long long)record->sequence, lockResult);
+        return false;
+    }
+    uint8_t *destination = (uint8_t *)IOSurfaceGetBaseAddress(surface);
+    uint64_t available = (uint64_t)IOSurfaceGetBytesPerRow(surface) *
+        IOSurfaceGetHeight(surface);
+    bool copied = destination != NULL && available >= record->vmSize;
+    if (copied) memcpy(destination, payload, (size_t)record->vmSize);
+    IOSurfaceUnlock(surface, 0, NULL);
+    if (!copied) {
+        ReceiverLog(@"final-composite-rejected stage=consumer-surface-storage "
+                    "sequence=%llu bytes=%llu available=%llu",
+                    (unsigned long long)record->sequence,
+                    (unsigned long long)record->vmSize,
+                    (unsigned long long)available);
+    }
+    return copied;
+}
+
 static void ReceiveAvailableMessages(void) {
     for (;;) {
         _Alignas(8) uint8_t bytes[
@@ -75,7 +220,7 @@ static void ReceiveAvailableMessages(void) {
             break;
         }
 
-        mach_port_t surfacePort = message->surfacePort.name;
+        mach_port_t memoryObjectPort = message->memoryObjectPort.name;
         mach_msg_audit_trailer_t *trailer =
             (mach_msg_audit_trailer_t *)(bytes +
                 round_msg(message->header.msgh_size));
@@ -91,16 +236,17 @@ static void ReceiveAvailableMessages(void) {
             message->header.msgh_size == sizeof(*message) &&
             (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
             message->body.msgh_descriptor_count == 1 &&
-            message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
-            MACH_PORT_VALID(surfacePort) && trailerValid;
+            message->memoryObjectPort.type == MACH_MSG_PORT_DESCRIPTOR &&
+            MACH_PORT_VALID(memoryObjectPort) && trailerValid;
         if (!envelopeValid) {
             BOOL receivedPortDescriptor =
                 (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
                 message->body.msgh_descriptor_count == 1 &&
-                message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
-                MACH_PORT_VALID(surfacePort);
+                message->memoryObjectPort.type == MACH_MSG_PORT_DESCRIPTOR &&
+                MACH_PORT_VALID(memoryObjectPort);
             if (receivedPortDescriptor)
-                (void)mach_port_deallocate(mach_task_self(), surfacePort);
+                (void)mach_port_deallocate(mach_task_self(),
+                                           memoryObjectPort);
             uint32_t witness = NextRejectWitness();
             if (witness <= 8) {
                 ReceiverLog(@"final-composite-rejected stage=envelope "
@@ -110,7 +256,8 @@ static void ReceiveAvailableMessages(void) {
                             message->header.msgh_size,
                             message->header.msgh_bits,
                             message->body.msgh_descriptor_count,
-                            message->surfacePort.type, surfacePort,
+                            message->memoryObjectPort.type,
+                            memoryObjectPort,
                             trailerValid ? @"valid" : @"invalid");
             }
             continue;
@@ -122,7 +269,7 @@ static void ReceiveAvailableMessages(void) {
         BOOL pidValid = record.producerPID == senderPID;
         BOOL producerValid = ProducerIsWindowServer(senderPID);
         if (!recordValid || !pidValid || !producerValid) {
-            (void)mach_port_deallocate(mach_task_self(), surfacePort);
+            (void)mach_port_deallocate(mach_task_self(), memoryObjectPort);
             uint32_t witness = NextRejectWitness();
             if (witness <= 8) {
                 char producerPath[PATH_MAX] = {0};
@@ -142,72 +289,81 @@ static void ReceiveAvailableMessages(void) {
             continue;
         }
 
-        IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surfacePort);
-        (void)mach_port_deallocate(mach_task_self(), surfacePort);
-        if (!surface) {
-            // Cross-task transport fallback.  WindowServer runs inside the
-            // chroot and displayd outside it; on this host a surface port
-            // created in another task never resolves through the per-task
-            // IOSurfaceClient (macwsallocd/main.m:205-210, runtime-confirmed
-            // 2026-06-19).  The publisher marks the frame kIOSurfaceIsGlobal,
-            // so the same frame stays addressable by ID.  Identity was already
-            // authenticated above (sender PID == record PID == WindowServer),
-            // and every surface and freshness check below still applies to
-            // whatever this lookup returns.
-            surface = IOSurfaceLookup((IOSurfaceID)record.surfaceID);
-            ReceiverLog(@"final-composite-lookup-fallback producer=%d "
-                        "sequence=%llu surface=%u port-lookup=nil id-lookup=%@",
-                        senderPID, (unsigned long long)record.sequence,
-                        record.surfaceID, surface ? @"hit" : @"nil");
-        }
-        if (!surface) {
+        // Freshness first: an obsolete frame costs nothing but a bounded map and
+        // copy, and the replay catch-up path depends on this gate rejecting it.
+        uint64_t requiredCompletionTime = atomic_load_explicit(
+            &ReplayMinimumCompletionTime, memory_order_acquire);
+        if (requiredCompletionTime != 0 &&
+            record.completionTime < requiredCompletionTime) {
+            (void)mach_port_deallocate(mach_task_self(), memoryObjectPort);
             uint32_t witness = NextRejectWitness();
             if (witness <= 8) {
-                ReceiverLog(@"final-composite-rejected stage=surface-lookup "
-                            "witness=%u producer=%d sequence=%llu surface=%u",
+                ReceiverLog(@"final-composite-rejected stage=freshness "
+                            "witness=%u producer=%d sequence=%llu "
+                            "completion=%llu required=%llu",
                             witness, senderPID,
                             (unsigned long long)record.sequence,
-                            record.surfaceID);
+                            (unsigned long long)record.completionTime,
+                            (unsigned long long)requiredCompletionTime);
             }
             continue;
         }
-        BOOL surfaceValid = IOSurfaceGetID(surface) == record.surfaceID &&
-            IOSurfaceGetWidth(surface) == record.width &&
-            IOSurfaceGetHeight(surface) == record.height &&
-            IOSurfaceGetBytesPerRow(surface) == record.bytesPerRow &&
-            (IOSurfaceGetPixelFormat(surface) == 0 ||
-             IOSurfaceGetPixelFormat(surface) == record.ioSurfacePixelFormat);
-        uint64_t requiredCompletionTime = atomic_load_explicit(
-            &ReplayMinimumCompletionTime, memory_order_acquire);
-        BOOL fresh = requiredCompletionTime == 0 ||
-            record.completionTime >= requiredCompletionTime;
-        if (surfaceValid && fresh) {
-            atomic_store_explicit(&FinalCompositeAccepted, true,
-                                  memory_order_release);
-            if (AcceptedHandler) AcceptedHandler(surface, record);
-        } else {
+
+        mach_vm_address_t payloadAddress = 0;
+        kern_return_t mapResult = mach_vm_map(
+            mach_task_self(), &payloadAddress, (mach_vm_size_t)record.vmSize,
+            0, VM_FLAGS_ANYWHERE, memoryObjectPort,
+            (memory_object_offset_t)record.vmOffset, FALSE, VM_PROT_READ,
+            VM_PROT_READ, VM_INHERIT_NONE);
+        (void)mach_port_deallocate(mach_task_self(), memoryObjectPort);
+        if (mapResult != KERN_SUCCESS || payloadAddress == 0) {
+            uint32_t witness = NextRejectWitness();
+            if (witness <= 8) {
+                ReceiverLog(@"final-composite-rejected stage=vm-map "
+                            "witness=%u producer=%d sequence=%llu "
+                            "offset=%llu bytes=%llu kr=%#x",
+                            witness, senderPID,
+                            (unsigned long long)record.sequence,
+                            (unsigned long long)record.vmOffset,
+                            (unsigned long long)record.vmSize, mapResult);
+            }
+            continue;
+        }
+
+        IOSurfaceRef surface = AcquireConsumerSurface(&record);
+        bool copied = surface && CopyPayloadIntoSurface(
+            &record, (const void *)(uintptr_t)payloadAddress, surface);
+        (void)mach_vm_deallocate(mach_task_self(), payloadAddress,
+                                 (mach_vm_size_t)record.vmSize);
+        if (!copied) {
             uint32_t witness = NextRejectWitness();
             if (witness <= 8) {
                 ReceiverLog(@"final-composite-rejected stage=%@ "
                             "witness=%u producer=%d sequence=%llu "
-                            "completion=%llu required=%llu fresh=%@ "
-                            "expected=(%u %ux%u bpr=%u pf=%08x) "
-                            "actual=(%u %zux%zu bpr=%zu pf=%08x)",
-                            surfaceValid ? @"freshness" : @"surface",
+                            "geometry=%ux%u bpr=%u",
+                            surface ? @"consumer-copy" : @"consumer-surface",
                             witness, senderPID,
-                            (unsigned long long)record.sequence,
-                            (unsigned long long)record.completionTime,
-                            (unsigned long long)requiredCompletionTime,
-                            fresh ? @"YES" : @"NO",
-                            record.surfaceID, record.width, record.height,
-                            record.bytesPerRow, record.ioSurfacePixelFormat,
-                            IOSurfaceGetID(surface), IOSurfaceGetWidth(surface),
-                            IOSurfaceGetHeight(surface),
-                            IOSurfaceGetBytesPerRow(surface),
-                            IOSurfaceGetPixelFormat(surface));
+                            (unsigned long long)record.sequence, record.width,
+                            record.height, record.bytesPerRow);
             }
+            continue;
         }
-        CFRelease(surface);
+
+        atomic_store_explicit(&FinalCompositeAccepted, true,
+                              memory_order_release);
+        uint32_t accepted = atomic_fetch_add_explicit(
+            &AcceptedFrames, 1, memory_order_relaxed) + 1;
+        if (accepted <= 8 || accepted % 128 == 0) {
+            ReceiverLog(@"final-composite-accepted count=%u producer=%d "
+                        "sequence=%llu geometry=%ux%u bpr=%u bytes=%llu "
+                        "transport=vm consumer-surface=%u",
+                        accepted, senderPID,
+                        (unsigned long long)record.sequence, record.width,
+                        record.height, record.bytesPerRow,
+                        (unsigned long long)record.vmSize,
+                        IOSurfaceGetID(surface));
+        }
+        if (AcceptedHandler) AcceptedHandler(surface, record);
     }
 }
 

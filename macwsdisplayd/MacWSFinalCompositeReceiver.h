@@ -10,8 +10,10 @@ typedef void (^MacWSFinalCompositeAcceptedHandler)(
 typedef void (^MacWSFinalCompositeReceiverLogHandler)(NSString *message);
 
 // Starts the authenticated WindowServer-only Mach receiver on queue. The
-// receiver owns envelope, audit-token, producer-path and IOSurface validation;
-// displayd's presentation layer sees only accepted immutable frames.
+// receiver owns envelope, audit-token and producer-path validation, maps the
+// frame's Mach memory object, copies it into a surface this process owns, and
+// only then reports the frame; displayd's presentation layer sees accepted
+// immutable frames whose lifetime it controls.
 BOOL MacWSStartFinalCompositeReceiver(
     dispatch_queue_t queue,
     MacWSFinalCompositeAcceptedHandler acceptedHandler,
