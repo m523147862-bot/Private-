@@ -1,5 +1,12 @@
 # Builds DCMMC/macPad's macOS-side artifacts on a GitHub-hosted macOS runner.
 #
+# Runner choice: GitHub retired the macOS 13 image, so this runs on macos-14,
+# the oldest macOS image still offered (macos-13 jobs queue forever -- observed
+# 2026-10-21, actions/runner-images lists only macOS 14/15/26). The property
+# that matters is Apple ld64, not a pinned ld64 build: any Xcode ld64 emits the
+# arm64e __cfstring `auth-bind ... key=DA` fixups that on-device lld cannot,
+# and the fixup + load-command assertions below re-verify that on the artifact.
+#
 # Provenance: this repository is a verbatim mirror of DCMMC/macPad
 # (https://github.com/DCMMC/macPad, GPL-3.0) at commit
 # a18da08455d8aac96d53b6fe2a00699c4b97f56c, plus this workflow file. Upstream
@@ -36,7 +43,7 @@ permissions:
 jobs:
   windowing:
     name: MacWSWindowing (Apple ld64)
-    runs-on: macos-13
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,9 +52,6 @@ jobs:
       - name: Report the toolchain identity
         run: |
           set -euxo pipefail
-          if [ -d /Applications/Xcode_14.3.1.app ]; then
-            sudo xcode-select -s /Applications/Xcode_14.3.1.app
-          fi
           xcode-select -p
           xcodebuild -version
           sw_vers
@@ -122,7 +126,7 @@ jobs:
 
   macosx-targets:
     name: macOS-side subprojects
-    runs-on: macos-13
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,9 +135,6 @@ jobs:
       - name: Report the toolchain identity
         run: |
           set -euxo pipefail
-          if [ -d /Applications/Xcode_14.3.1.app ]; then
-            sudo xcode-select -s /Applications/Xcode_14.3.1.app
-          fi
           xcode-select -p
           xcodebuild -version
           ld -v
