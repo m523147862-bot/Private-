@@ -145,6 +145,22 @@ static void ReceiveAvailableMessages(void) {
         IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surfacePort);
         (void)mach_port_deallocate(mach_task_self(), surfacePort);
         if (!surface) {
+            // Cross-task transport fallback.  WindowServer runs inside the
+            // chroot and displayd outside it; on this host a surface port
+            // created in another task never resolves through the per-task
+            // IOSurfaceClient (macwsallocd/main.m:205-210, runtime-confirmed
+            // 2026-06-19).  The publisher marks the frame kIOSurfaceIsGlobal,
+            // so the same frame stays addressable by ID.  Identity was already
+            // authenticated above (sender PID == record PID == WindowServer),
+            // and every surface and freshness check below still applies to
+            // whatever this lookup returns.
+            surface = IOSurfaceLookup((IOSurfaceID)record.surfaceID);
+            ReceiverLog(@"final-composite-lookup-fallback producer=%d "
+                        "sequence=%llu surface=%u port-lookup=nil id-lookup=%@",
+                        senderPID, (unsigned long long)record.sequence,
+                        record.surfaceID, surface ? @"hit" : @"nil");
+        }
+        if (!surface) {
             uint32_t witness = NextRejectWitness();
             if (witness <= 8) {
                 ReceiverLog(@"final-composite-rejected stage=surface-lookup "

@@ -402,6 +402,14 @@ static MacWSFinalCompositeSnapshotSlot *AcquireSnapshotSlot(
             (__bridge id)kIOSurfaceAllocSize: @(bytesPerRow * height),
             (__bridge id)kIOSurfacePixelFormat:
                 @(MACWS_FINAL_COMPOSITE_BGRA),
+            // Cross-task handoff.  displayd runs outside the chroot and cannot
+            // resolve an IOSurface mach port created in this task
+            // (macwsallocd/main.m:205-210, runtime-confirmed 2026-06-19), so it
+            // receives this frame by ID instead.  kIOSurfaceIsGlobal is the
+            // documented precondition for IOSurfaceLookup() across tasks;
+            // spelled as the raw property key because the IOSurface header
+            // marks that macro deprecated.
+            @"IOSurfaceIsGlobal": @YES,
         };
         IOSurfaceRef surface = IOSurfaceCreate(
             (__bridge CFDictionaryRef)properties);
