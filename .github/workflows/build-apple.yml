@@ -33,9 +33,6 @@ on:
 permissions:
   contents: read
 
-env:
-  THEOS: ${{ runner.temp }}/theos
-
 jobs:
   windowing:
     name: MacWSWindowing (Apple ld64)
@@ -62,8 +59,9 @@ jobs:
         run: |
           set -euxo pipefail
           brew install ldid
-          git clone --recursive --depth 1 https://github.com/theos/theos "$THEOS"
-          ls "$THEOS/makefiles/common.mk" "$THEOS/vendor/logos/bin/logos.pl"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          git clone --recursive --depth 1 https://github.com/theos/theos "$RUNNER_TEMP/theos"
+          ls "$RUNNER_TEMP/theos/makefiles/common.mk"              "$RUNNER_TEMP/theos/vendor/logos/bin/logos.pl"
 
       - name: Snapshot the Windowing sources for the artifact contract
         run: |
@@ -147,8 +145,9 @@ jobs:
         run: |
           set -euxo pipefail
           brew install ldid
-          git clone --recursive --depth 1 https://github.com/theos/theos "$THEOS"
-          ls "$THEOS/makefiles/common.mk" "$THEOS/vendor/logos/bin/logos.pl"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          git clone --recursive --depth 1 https://github.com/theos/theos "$RUNNER_TEMP/theos"
+          ls "$RUNNER_TEMP/theos/makefiles/common.mk"              "$RUNNER_TEMP/theos/vendor/logos/bin/logos.pl"
 
       # The seven targets the iPad cannot build: six `macosx:clang:latest:13.0`
       # tools plus libmachook (iphone target, both slices, post-processed with a
