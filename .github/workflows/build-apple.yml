@@ -1,0 +1,211 @@
+# Builds DCMMC/macPad's macOS-side artifacts on a GitHub-hosted macOS runner.
+#
+# Provenance: this repository is a verbatim mirror of DCMMC/macPad
+# (https://github.com/DCMMC/macPad, GPL-3.0) at commit
+# a18da08455d8aac96d53b6fe2a00699c4b97f56c, plus this workflow file. Upstream
+# LICENSE and copyright notices are preserved unchanged.
+#
+# Why this exists: the iPad-side Theos tree ships no macOS SDK at all
+# ("You do not have any SDKs in /var/jb/var/mobile/theos/sdks", a3_logs/
+# a32_rest2.log) and links arm64e with on-device lld, which emits a plain
+# `bind` instead of the `auth-bind ... key=DA` __cfstring fixup that arm64e
+# SpringBoard requires. A macOS host supplies both missing pieces: Xcode's
+# Apple ld64 and Xcode's MacOSX SDK, which Theos finds through
+# THEOS_PLATFORM_SDK_ROOT = `xcode-select -p`.
+#
+# Artifacts (download from the run page or the Actions artifacts API):
+#   macws-windowing  MacWSWindowing.dylib + MacWSWindowing.sha256 +
+#                    MacWSWindowing.build.json, i.e. the same contract that
+#                    misc/deploy_macwswindowing.sh creates before it stages the
+#                    tweak into /var/jb/var/mobile/macws-cross-build.
+#   macosx-targets   the seven macOS-side subproject products:
+#                    launchservicesd, libmachook, macwsinputd, macwsdisplayd,
+#                    macwsinteropd, macwsworkspacectl, macws-neofetch.
+
+name: Build macPad macOS-side artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-apple.yml']
+
+permissions:
+  contents: read
+
+env:
+  THEOS: ${{ runner.temp }}/theos
+
+jobs:
+  windowing:
+    name: MacWSWindowing (Apple ld64)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Report the toolchain identity
+        run: |
+          set -euxo pipefail
+          if [ -d /Applications/Xcode_14.3.1.app ]; then
+            sudo xcode-select -s /Applications/Xcode_14.3.1.app
+          fi
+          xcode-select -p
+          xcodebuild -version
+          sw_vers
+          ld -v
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install Theos and its Darwin signing tool
+        run: |
+          set -euxo pipefail
+          brew install ldid
+          git clone --recursive --depth 1 https://github.com/theos/theos "$THEOS"
+          ls "$THEOS/makefiles/common.mk" "$THEOS/vendor/logos/bin/logos.pl"
+
+      - name: Snapshot the Windowing sources for the artifact contract
+        run: |
+          set -euxo pipefail
+          python3 misc/macws_artifact_contract.py snapshot \
+            --root . --manifest "$RUNNER_TEMP/snapshot.json"
+
+      - name: Build the tweak and check the Apple-ld64 arm64e fixups
+        run: |
+          set -euo pipefail
+          make -C MacWSWindowing clean all \
+            FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+            THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+            2>&1 | tee "$RUNNER_TEMP/windowing-build.log"
+          BUILT=MacWSWindowing/.theos/obj/MacWSWindowing.dylib
+          test -s "$BUILT"
+          lipo -info "$BUILT"
+          dyld_info -arch arm64e -fixups "$BUILT" > "$RUNNER_TEMP/fixups.txt"
+          cf_count=$(awk '$2 == "__cfstring" && $4 == "auth-bind" && /key=DA/ { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
+          plain_cf_count=$(awk '$2 == "__cfstring" && $4 == "bind" { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
+          if [ "$cf_count" -lt 1 ] || [ "$plain_cf_count" -ne 0 ]; then
+            echo "ERROR: Apple-ld64 auth-fixup invariant failed (auth=$cf_count plain=$plain_cf_count)." >&2
+            exit 1
+          fi
+          echo "==> Verified arm64e __cfstring fixups: auth-bind/key=DA count=$cf_count, plain-bind count=0"
+          LOAD_COMMANDS=$(otool -L "$BUILT")
+          printf '%s\n' "$LOAD_COMMANDS"
+          if printf '%s\n' "$LOAD_COMMANDS" | grep -q $'\t/Library/'; then
+            echo 'ERROR: MacWSWindowing contains rootful /Library load commands.' >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$LOAD_COMMANDS" |
+              grep -q $'\t@rpath/CydiaSubstrate.framework/CydiaSubstrate '; then
+            echo 'ERROR: MacWSWindowing lacks its rootless @rpath Substrate dependency.' >&2
+            exit 1
+          fi
+          echo '==> Verified rootless MacWSWindowing load commands'
+
+      - name: Create the Windowing artifact contract
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp MacWSWindowing/.theos/obj/MacWSWindowing.dylib out/MacWSWindowing.dylib
+          python3 misc/macws_artifact_contract.py create \
+            --root . \
+            --binary out/MacWSWindowing.dylib \
+            --manifest out/MacWSWindowing.build.json \
+            --source-snapshot "$RUNNER_TEMP/snapshot.json"
+          ( cd out && shasum -a 256 MacWSWindowing.dylib > MacWSWindowing.sha256 )
+          cat out/MacWSWindowing.sha256 out/MacWSWindowing.build.json
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macws-windowing
+          path: out/
+          if-no-files-found: error
+
+  macosx-targets:
+    name: macOS-side subprojects
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Report the toolchain identity
+        run: |
+          set -euxo pipefail
+          if [ -d /Applications/Xcode_14.3.1.app ]; then
+            sudo xcode-select -s /Applications/Xcode_14.3.1.app
+          fi
+          xcode-select -p
+          xcodebuild -version
+          ld -v
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
+          ls "$(xcrun --sdk macosx --show-sdk-path)/usr/lib/libbsm.tbd" || true
+
+      - name: Install Theos and its Darwin signing tool
+        run: |
+          set -euxo pipefail
+          brew install ldid
+          git clone --recursive --depth 1 https://github.com/theos/theos "$THEOS"
+          ls "$THEOS/makefiles/common.mk" "$THEOS/vendor/logos/bin/logos.pl"
+
+      # The seven targets the iPad cannot build: six `macosx:clang:latest:13.0`
+      # tools plus libmachook (iphone target, both slices, post-processed with a
+      # macOS load identity below exactly like misc/build.sh does).
+      - name: Build the macOS-side subprojects
+        run: |
+          set -euo pipefail
+          SUBPROJECTS="launchservicesd libmachook macwsinputd macwsdisplayd \
+            macwsinteropd macwsworkspacectl macwsneofetch"
+          make SUBPROJECTS="$SUBPROJECTS" all \
+            FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+            2>&1 | tee "$RUNNER_TEMP/macosx-build.log"
+
+      - name: Collect the subproject products
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          collect() {
+            sub="$1"
+            product="$2"
+            built="$sub/.theos/obj/$product"
+            if [ ! -s "$built" ]; then
+              echo "ERROR: missing product $built" >&2
+              exit 1
+            fi
+            mkdir -p "out/$sub"
+            cp "$built" "out/$sub/$product"
+          }
+          collect launchservicesd launchservicesd
+          collect libmachook libmachook.dylib
+          collect macwsinputd macwsinputd
+          collect macwsdisplayd macwsdisplayd
+          collect macwsinteropd macwsinteropd
+          collect macwsworkspacectl macwsworkspacectl
+          collect macwsneofetch macws-neofetch
+
+      # misc/build.sh: libmachook is linked with the iPhoneOS SDK and needs its
+      # build version rewritten so macOS dyld accepts it inside macOS processes.
+      - name: Give libmachook its macOS load identity
+        run: |
+          set -euo pipefail
+          f=out/libmachook/libmachook.dylib
+          python3 misc/set_macos_version.py "$f"
+          ldid -S "$f"
+          codesign -f -s - "$f"
+          lipo -info "$f"
+          otool -arch arm64 -l "$f" | grep -A3 LC_BUILD_VERSION
+
+      - name: Record sizes and checksums
+        run: |
+          set -euo pipefail
+          ( cd out && find . -type f | sort | xargs shasum -a 256 > SHA256SUMS.txt )
+          cat out/SHA256SUMS.txt
+          find out -type f -exec ls -l {} +
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macosx-targets
+          path: out/
+          if-no-files-found: error
