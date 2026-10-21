@@ -96,16 +96,20 @@ jobs:
           # A correct Apple-ld64 __cfstring class reference is authenticated data
           # (key=DA). Xcode 14's dyld_info spelled that `auth-bind key=DA`; the
           # Xcode 15 spelling keeps the kind column as `bind` and moves the
-          # authentication into `(div=.. ad=1 key=DA)`. Count the authentication
-          # marker itself so the same invariant holds for either spelling.
-          cf_count=$(awk '$2 == "__cfstring" && /key=DA/ { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
-          plain_cf_count=$(awk '$2 == "__cfstring" && $4 == "bind" && !/key=DA/ { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
-          grep '__cfstring' "$RUNNER_TEMP/fixups.txt" | head -4
-          if [ "$cf_count" -lt 1 ] || [ "$plain_cf_count" -ne 0 ]; then
-            echo "ERROR: Apple-ld64 auth-fixup invariant failed (authenticated=$cf_count plain=$plain_cf_count)." >&2
+          # authentication into the trailing `(div=.. ad=1 key=DA)`. Assert the
+          # property, not the spelling: every fixup that references
+          # ___CFConstantStringClassReference must carry key=DA, and none may be
+          # a plain bind. `__auth_got` key=I rows are counted for the log only.
+          grep -m 4 'CFConstantString' "$RUNNER_TEMP/fixups.txt" || true
+          authed_cf=$(awk '/CFConstantString/ && /key=DA/ { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
+          bad_cf=$(awk '/CFConstantString/ && !/key=DA/ { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
+          auth_got=$(awk '$2 == "__auth_got" && /key=I/ { count++ } END { print count+0 }' "$RUNNER_TEMP/fixups.txt")
+          echo "==> __cfstring refs authenticated(key=DA)=$authed_cf plain=$bad_cf; __auth_got key=I rows=$auth_got (informational)"
+          if [ "$authed_cf" -lt 1 ] || [ "$bad_cf" -ne 0 ]; then
+            echo "ERROR: Apple-ld64 auth-fixup invariant failed (authenticated=$authed_cf plain=$bad_cf)." >&2
             exit 1
           fi
-          echo "==> Verified arm64e __cfstring fixups: authenticated/key=DA count=$cf_count, plain-bind count=0"
+          echo "==> Verified arm64e __cfstring fixups: every reference is authenticated key=DA"
           LOAD_COMMANDS=$(otool -L "$BUILT")
           printf '%s\n' "$LOAD_COMMANDS"
           if printf '%s\n' "$LOAD_COMMANDS" | grep -q $'\t/Library/'; then
