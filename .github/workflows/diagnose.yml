@@ -70,3 +70,40 @@ jobs:
             echo "-- $f"
             dyld_info -arch arm64e -fixups "$f" | awk '$2 == "__cfstring" { print $4, $5 }' | sort | uniq -c
           done
+
+  classic:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Theos
+        run: |
+          set -euxo pipefail
+          brew install ldid
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          git clone --quiet --recursive --depth 1 https://github.com/theos/theos "$RUNNER_TEMP/theos"
+
+      - name: Link with the classic linker variants
+        run: |
+          set -uxo pipefail
+          XC=/Applications/Xcode_15.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+          ls -l "$XC/ld-classic" && "$XC/ld-classic" -v | head -3
+          report() {
+            bin="$1"; tag="$2"
+            cp "$bin" "$RUNNER_TEMP/classic-$tag.dylib"
+            echo "================ $tag"
+            lipo -info "$bin"
+            echo "--- chained fixups load command?"
+            otool -arch arm64e -l "$bin" | grep -c LC_DYLD_CHAINED_FIXUPS || true
+            otool -arch arm64e -l "$bin" | grep -c LC_DYLD_INFO_ONLY || true
+            echo "--- __cfstring rows"
+            dyld_info -arch arm64e -fixups "$bin" | awk '$2 == "__cfstring" { print $4, $5 }' | sort | uniq -c
+            echo "--- sample"
+            dyld_info -arch arm64e -fixups "$bin" | grep '__cfstring' | head -3
+          }
+          for flags in "-Wl,-ld_classic" "-Wl,-ld_classic,-fixup_chains" "-Wl,-fixup_chains,-ld_classic"; do
+            tag=$(echo "$flags" | tr '=,' '__')
+            echo "##### flags=$flags"
+            make -C MacWSWindowing clean all FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2               THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1               MacWSWindowing_LDFLAGS="$flags" 2>&1 | tail -4
+            report MacWSWindowing/.theos/obj/MacWSWindowing.dylib "$tag" || true
+          done
