@@ -224,7 +224,8 @@ jobs:
       - name: Record sizes and checksums
         run: |
           set -euo pipefail
-          ( cd out && find . -type f | sort | xargs shasum -a 256 > SHA256SUMS.txt )
+          ( cd out && find . -type f -not -name SHA256SUMS.txt | sort |
+              xargs shasum -a 256 > SHA256SUMS.txt )
           cat out/SHA256SUMS.txt
           find out -type f -exec ls -l {} +
 
